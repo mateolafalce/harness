@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Minimal harness for gpt-oss-120b on Cerebras with shell access."""
+"""Command-line harness for gpt-oss-120b on Cerebras with shell access."""
 
 from __future__ import annotations
 
@@ -100,15 +100,14 @@ def execute_tool(
     return f"Unknown tool: {name}"
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Cerebras gpt-oss-120b agent with a Bash tool."
     )
     parser.add_argument(
         "prompt",
         nargs="?",
-        default="How many files are in the current directory?",
-        help="Task for the model.",
+        help="Task for the model. Omit it to start interactive mode.",
     )
     parser.add_argument("--model", default="gpt-oss-120b")
     parser.add_argument(
@@ -124,31 +123,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run commands without asking for confirmation (dangerous).",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> int:
-    args = parse_args()
-    load_dotenv(Path(__file__).resolve().with_name(".env"), override=False)
-    if not os.environ.get("CEREBRAS_API_KEY"):
-        print(
-            "Error: CEREBRAS_API_KEY is missing from the environment or .env file.",
-            file=sys.stderr,
-        )
-        return 2
-
-    client = Cerebras(api_key=os.environ["CEREBRAS_API_KEY"])
-    messages: list[Any] = [
-        {
-            "role": "system",
-            "content": (
-                "You are an assistant with access to a Bash terminal. "
-                "Use run_bash when you need to inspect or modify the environment. "
-                "Explain the final result clearly and concisely."
-            ),
-        },
-        {"role": "user", "content": args.prompt},
-    ]
+def run_turn(
+    client: Cerebras,
+    messages: list[Any],
+    prompt: str,
+    args: argparse.Namespace,
+) -> int:
+    """Send one user turn, including any tool calls requested by the model."""
+    messages.append({"role": "user", "content": prompt})
 
     for tool_round in range(args.max_tool_rounds + 1):
         response = client.chat.completions.create(
@@ -165,14 +150,15 @@ def main() -> int:
         if message.content:
             print(message.content)
 
+        # Keep the complete assistant message so interactive conversations retain
+        # context and tool calls remain paired with their results.
+        messages.append(message.model_dump(exclude_none=True))
+
         if not message.tool_calls:
             return 0
 
         if tool_round == args.max_tool_rounds:
             break
-
-        # Preserve the complete message, including reasoning and tool_calls.
-        messages.append(message.model_dump(exclude_none=True))
 
         for call in message.tool_calls:
             name = call.function.name
@@ -205,6 +191,85 @@ def main() -> int:
         file=sys.stderr,
     )
     return 1
+
+
+def interactive_cli(
+    client: Cerebras,
+    messages: list[Any],
+    args: argparse.Namespace,
+) -> int:
+    """Run a small read-eval-print loop while preserving conversation history."""
+    if not sys.stdin.isatty():
+        print(
+            "Error: provide a prompt when standard input is not interactive.",
+            file=sys.stderr,
+        )
+        return 2
+
+    print("Harness interactive mode. Type /help for help or /exit to quit.")
+    while True:
+        try:
+            prompt = input("\nyou> ").strip()
+        except EOFError:
+            print()
+            return 0
+        except KeyboardInterrupt:
+            print("\nUse /exit or Ctrl-D to quit.")
+            continue
+
+        if not prompt:
+            continue
+        if prompt in {"/exit", "/quit"}:
+            return 0
+        if prompt == "/help":
+            print("Enter a task for the agent. Commands: /help, /exit, /quit")
+            continue
+
+        try:
+            exit_code = run_turn(client, messages, prompt, args)
+        except KeyboardInterrupt:
+            print("\nRequest interrupted.", file=sys.stderr)
+            continue
+        except Exception as exc:
+            print(f"Error communicating with Cerebras: {exc}", file=sys.stderr)
+            continue
+
+        if exit_code:
+            return exit_code
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    load_dotenv(Path(__file__).resolve().with_name(".env"), override=False)
+    if not os.environ.get("CEREBRAS_API_KEY"):
+        print(
+            "Error: CEREBRAS_API_KEY is missing from the environment or .env file.",
+            file=sys.stderr,
+        )
+        return 2
+
+    client = Cerebras(api_key=os.environ["CEREBRAS_API_KEY"])
+    messages: list[Any] = [
+        {
+            "role": "system",
+            "content": (
+                "You are an assistant with access to a Bash terminal. "
+                "Use run_bash when you need to inspect or modify the environment. "
+                "Explain the final result clearly and concisely."
+            ),
+        },
+    ]
+    if args.prompt is None:
+        return interactive_cli(client, messages, args)
+
+    try:
+        return run_turn(client, messages, args.prompt, args)
+    except KeyboardInterrupt:
+        print("\nRequest interrupted.", file=sys.stderr)
+        return 130
+    except Exception as exc:
+        print(f"Error communicating with Cerebras: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

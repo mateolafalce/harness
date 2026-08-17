@@ -18,6 +18,17 @@ variable already exported in the shell takes precedence and is not overwritten.
 
 ## Usage
 
+Start an interactive conversation:
+
+```bash
+.venv/bin/python harness.py
+```
+
+Use `/help` to list the available commands and `/exit` (or Ctrl-D) to quit.
+The conversation history is kept for the duration of the session.
+
+To run a single task and exit:
+
 ```bash
 .venv/bin/python harness.py "How many files are in this directory?"
 ```
