@@ -1,51 +1,110 @@
-# Harness (in progress)
+# Harness — Etapa 2: primer agent loop
 
-A terminal agent that uses `gpt-oss-120b` through Cerebras and exposes a
-`run_bash` tool to the model.
+Cliente conversacional de terminal para `gpt-oss-120b` mediante la API de
+Cerebras. El modelo puede responder directamente o pedir herramientas; el
+programa ejecuta cada llamada, devuelve su resultado y repite hasta obtener una
+respuesta final.
 
-## Setup
+El loop se mantiene deliberadamente directo, sin un framework de agentes:
+
+1. agrega el mensaje del usuario al historial;
+2. llama al modelo con los esquemas de herramientas y `tool_choice="auto"`;
+3. si hay `tool_calls`, valida y ejecuta cada una;
+4. agrega cada resultado con el `tool_call_id` correspondiente;
+5. vuelve al paso 2 hasta recibir una respuesta final.
+
+## Herramientas
+
+Las tres herramientas no acceden a red ni modifican archivos:
+
+- `calculator`: evalúa expresiones numéricas con `+`, `-`, `*`, `/`, `//`, `%`
+  y `**`. Usa un intérprete limitado basado en el AST de Python, no `eval`.
+- `get_current_time`: devuelve la hora actual para una zona horaria IANA, por
+  ejemplo `UTC` o `America/Argentina/Mendoza`.
+- `echo`: devuelve texto sin modificar. Se incluye como tercera herramienta
+  inocua porque la consigna indica tres aunque enumera solo las dos anteriores.
+
+Cada herramienta declara un esquema JSON estricto. Antes de ejecutarla, el
+harness comprueba que los argumentos sean JSON, que estén todos los campos
+requeridos, que sus tipos sean correctos y que no haya propiedades adicionales.
+Un nombre desconocido, JSON inválido, argumentos inválidos o un error durante la
+ejecución produce un resultado estructurado con `ok: false`; ese resultado se
+envía al modelo para que pueda recuperarse.
+
+## Límites y observabilidad
+
+Cada mensaje del usuario tiene dos guardrails configurables:
+
+- `--max-turns`: máximo de llamadas al modelo, 8 por defecto;
+- `--timeout`: límite total de tiempo del loop, 30 segundos por defecto. El
+  tiempo restante también se pasa como timeout a cada llamada a la API.
+
+Si se supera un límite o falla la API, se descarta del historial el turno
+incompleto para que la conversación conserve una secuencia válida.
+
+El registro JSON Lines incluye el inicio y fin de la sesión, mensajes del
+usuario, inicio de cada iteración, solicitudes y respuestas de API, decisiones
+del agente, inicio y resultado de herramientas, `call_id`, argumentos, errores,
+latencias, métricas y causa de terminación. Las preguntas, respuestas y
+argumentos se guardan completos, por lo que el archivo puede contener
+información sensible.
+
+## Instalación
 
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 cp .env.example .env
-# Edit .env and add your API key.
+# Editar .env y agregar la API key.
 ```
 
-Create an API key in the [Cerebras console](https://cloud.cerebras.ai/).
-The harness automatically loads `CEREBRAS_API_KEY` from `.env`; an environment
-variable already exported in the shell takes precedence and is not overwritten.
+La API key se crea en la [consola de Cerebras](https://cloud.cerebras.ai/). El
+programa carga `CEREBRAS_API_KEY` desde `.env`; una variable ya exportada tiene
+precedencia.
 
-## Usage
+## Uso
 
-Start an interactive conversation:
+Conversación interactiva:
 
 ```bash
 .venv/bin/python harness.py
 ```
 
-Use `/help` to list the available commands and `/exit` (or Ctrl-D) to quit.
-The conversation history is kept for the duration of the session.
+Durante una conversación interactiva, `/clear` elimina los turnos acumulados
+del usuario, el asistente y las herramientas, pero conserva la instrucción de
+sistema. El comando no hace una solicitud al modelo. `/help` muestra todos los
+comandos disponibles.
 
-To run a single task and exit:
-
-```bash
-.venv/bin/python harness.py "How many files are in this directory?"
-```
-
-The program asks for confirmation before running each command. In an isolated
-environment where you accept the risk of arbitrary command execution, you can
-skip confirmation:
+Una sola pregunta:
 
 ```bash
-.venv/bin/python harness.py --auto-approve "Review the tests and explain the failures"
+.venv/bin/python harness.py "¿Cuánto es (27 + 5) * 3?"
 ```
 
-Useful options:
+Configuración de límites y log:
+
+```bash
+.venv/bin/python harness.py \
+  --max-turns 5 \
+  --timeout 20 \
+  --log-file logs/sesion.jsonl \
+  "¿Qué hora es en America/Argentina/Mendoza?"
+```
+
+La utilización mostrada al final suma los tokens de todas las llamadas del loop
+y calcula `tokens_totales / ventana_de_contexto * 100`. La ventana
+predeterminada es 131.072 tokens y puede ajustarse con `--context-window`. Las
+métricas también muestran cuántos tokens del prompt fueron obtenidos desde la
+caché del proveedor.
+
+Para ver todas las opciones:
 
 ```bash
 .venv/bin/python harness.py --help
 ```
 
-> `--auto-approve` lets the model run any command with the same permissions as
-> your user. Use it only inside a disposable container or workspace.
+## Pruebas
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+```
