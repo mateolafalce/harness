@@ -69,6 +69,12 @@ class ParseArgsTests(unittest.TestCase):
         self.assertEqual(args.timeout, 30.0)
         self.assertEqual(args.approval_policy, "ask")
         self.assertEqual(args.sandbox, "disposable")
+        self.assertEqual(args.compaction_threshold, 0.70)
+        self.assertEqual(args.keep_recent_turns, 2)
+        self.assertEqual(args.relevant_files, 8)
+        self.assertEqual(args.session_file, Path(".harness/session.json"))
+        self.assertEqual(args.progress_file, Path(".harness/progress.md"))
+        self.assertFalse(args.resume)
 
     def test_prompt_and_flags_are_parsed(self):
         args = harness.parse_args(
@@ -102,9 +108,16 @@ class ParseArgsTests(unittest.TestCase):
             ):
                 harness.parse_args([flag, value])
 
+    def test_compaction_threshold_must_be_a_ratio(self):
+        for value in ("0", "1", "nan"):
+            with self.subTest(value=value), redirect_stderr(
+                io.StringIO()
+            ), self.assertRaises(SystemExit):
+                harness.parse_args(["--compaction-threshold", value])
+
 
 class ToolTests(unittest.TestCase):
-    def test_declares_strict_input_schemas_for_stage_four_tools(self):
+    def test_declares_strict_input_schemas_for_agent_tools(self):
         names = {tool["function"]["name"] for tool in harness.TOOLS}
 
         self.assertEqual(
@@ -519,6 +532,254 @@ class EditingAndShellToolTests(unittest.TestCase):
         self.assertTrue(allowed["ok"])
         self.assertEqual(allowed["approval"], "granted")
         self.assertEqual((self.root / "allowed.txt").read_text(), "no\n")
+
+
+class ContextEngineeringTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.root = Path(self.temp_dir.name).resolve()
+        self.root_patch = patch("harness._repository_root", return_value=self.root)
+        self.root_patch.start()
+        self.addCleanup(self.root_patch.stop)
+
+    def write_text(self, relative_path, content):
+        path = self.root / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    def test_loads_global_root_and_nested_agents_in_precedence_order(self):
+        global_path = self.write_text("global.md", "global rules")
+        self.write_text("AGENTS.md", "root rules")
+        self.write_text("src/AGENTS.md", "nested rules")
+        self.write_text("src/module.py", "value = 1")
+
+        documents = harness.load_instruction_documents(
+            self.root,
+            global_path,
+            ["src/module.py"],
+        )
+
+        self.assertEqual(
+            [label for label, _content in documents],
+            [str(global_path), "AGENTS.md", "src/AGENTS.md"],
+        )
+        prompt = harness.build_system_prompt("base", documents)
+        self.assertLess(prompt.index("global rules"), prompt.index("root rules"))
+        self.assertLess(prompt.index("root rules"), prompt.index("nested rules"))
+        read_result = harness.read_file(
+            {"path": "src/module.py", "start_line": 1, "max_lines": 10}
+        )
+        self.assertEqual(
+            read_result["applicable_instruction_files"],
+            ["AGENTS.md", "src/AGENTS.md"],
+        )
+
+    def test_selects_relevant_paths_from_names_without_reading_contents(self):
+        self.write_text("src/session_store.py", "unrelated")
+        self.write_text("tests/test_session_store.py", "unrelated")
+        self.write_text("docs/security.md", "session persistence")
+
+        selected = harness.select_relevant_files(
+            "Fix session_store.py and its tests", limit=2
+        )
+
+        self.assertEqual(
+            set(selected),
+            {"src/session_store.py", "tests/test_session_store.py"},
+        )
+
+    def test_summarizes_oversized_tool_output_for_model_context(self):
+        result = {"ok": True, "result": {"output": "a" * 10_000}}
+
+        content, summarized = harness.summarize_tool_output(result, maximum=1_000)
+        payload = json.loads(content)
+
+        self.assertTrue(summarized)
+        self.assertLessEqual(len(content), 1_000)
+        self.assertTrue(payload["context_summary"])
+        self.assertEqual(payload["original_characters"], len(json.dumps(result)))
+        self.assertIn("Middle omitted", payload["notice"])
+
+    def test_compacts_old_turns_and_preserves_recent_turn_verbatim(self):
+        messages = [{"role": "system", "content": "rules"}]
+        for index in range(3):
+            messages.extend(
+                [
+                    {"role": "user", "content": f"question {index}"},
+                    {"role": "assistant", "content": f"answer {index}"},
+                ]
+            )
+
+        result = harness.compact_history(messages, keep_recent_turns=1)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(messages[0], {"role": "system", "content": "rules"})
+        self.assertIn("Compacted conversation", messages[1]["content"])
+        self.assertIn("question 0", messages[1]["content"])
+        self.assertEqual(
+            messages[-2:],
+            [
+                {"role": "user", "content": "question 2"},
+                {"role": "assistant", "content": "answer 2"},
+            ],
+        )
+
+    def test_compaction_waits_until_threshold_is_reached(self):
+        messages = [
+            {"role": "system", "content": "rules"},
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "new"},
+        ]
+
+        untouched = harness.maybe_compact_history(
+            messages, context_window=10_000, keep_recent_turns=1
+        )
+        compacted = harness.maybe_compact_history(
+            messages,
+            context_window=100,
+            threshold=0.5,
+            keep_recent_turns=1,
+            observed_prompt_tokens=80,
+        )
+
+        self.assertIsNone(untouched)
+        self.assertIsNotNone(compacted)
+        self.assertIn("old", messages[1]["content"])
+
+    def test_session_store_round_trips_and_rejects_other_repositories(self):
+        store = harness.SessionStore(Path("state/session.json"), self.root)
+        messages = [
+            {"role": "system", "content": "rules"},
+            {"role": "user", "content": "continue"},
+        ]
+        store.save("session-7", messages)
+
+        session_id, loaded = store.load()
+
+        self.assertEqual(session_id, "session-7")
+        self.assertEqual(loaded, messages)
+        self.assertEqual(store.path.stat().st_mode & 0o777, 0o600)
+        payload = json.loads(store.path.read_text(encoding="utf-8"))
+        payload["repository_root"] = str(self.root / "other")
+        store.path.write_text(json.dumps(payload), encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "different repository"):
+            store.load()
+
+    def test_runtime_state_refuses_to_overwrite_unrelated_files(self):
+        self.write_text("source.json", '{"application": true}')
+        self.write_text("notes.md", "# Project notes\n")
+
+        store = harness.SessionStore(Path("source.json"), self.root)
+
+        with self.assertRaisesRegex(RuntimeError, "non-session"):
+            store.ensure_safe_to_replace()
+        with self.assertRaisesRegex(ValueError, "non-progress"):
+            harness.ProgressTracker(Path("notes.md"), "session-1")
+        self.assertEqual(
+            (self.root / "source.json").read_text(), '{"application": true}'
+        )
+        self.assertEqual(
+            (self.root / "notes.md").read_text(), "# Project notes\n"
+        )
+
+    def test_progress_tracker_preserves_objective_across_instances(self):
+        tracker = harness.ProgressTracker(Path("state/progress.md"), "session-1")
+        tracker.start("Migrate the session persistence layer")
+        tracker.record_tool("read_file", True)
+
+        resumed = harness.ProgressTracker(Path("state/progress.md"), "session-1")
+        resumed.complete("Migration still needs verification")
+        content = resumed.path.read_text(encoding="utf-8")
+
+        self.assertIn("Migrate the session persistence layer", content)
+        self.assertIn("Tool `read_file` completed", content)
+        self.assertIn("Migration still needs verification", content)
+
+    def test_run_turn_persists_summarized_context_and_progress(self):
+        logger = harness.JsonlEventLogger(self.root / "events.jsonl", "session-9")
+        store = harness.SessionStore(Path("state/session.json"), self.root)
+        progress = harness.ProgressTracker(
+            Path("state/progress.md"), "session-9", load_existing=False
+        )
+        large_text = "x" * 10_000
+        client = Mock()
+        client.chat.completions.create.side_effect = [
+            make_response(
+                content=None,
+                tool_calls=[
+                    make_tool_call(
+                        name="echo",
+                        arguments=json.dumps({"text": large_text}),
+                    )
+                ],
+            ),
+            make_response(content="Done"),
+        ]
+        messages = [{"role": "system", "content": "rules"}]
+
+        with redirect_stdout(io.StringIO()):
+            harness.run_turn(
+                client,
+                messages,
+                "Echo a large value",
+                make_args(context_window=100_000),
+                logger,
+                store,
+                progress,
+            )
+
+        tool_payload = json.loads(messages[3]["content"])
+        self.assertTrue(tool_payload["context_summary"])
+        self.assertLessEqual(
+            len(messages[3]["content"]), harness.MAX_CONTEXT_TOOL_OUTPUT_CHARS
+        )
+        self.assertEqual(store.load(), ("session-9", messages))
+        self.assertIn("Turn completed: Done", progress.path.read_text())
+
+    def test_main_resumes_session_identity_and_conversation(self):
+        session_path = self.root / "session.json"
+        progress_path = self.root / "progress.md"
+        log_path = self.root / "events.jsonl"
+        client = Mock()
+        client.chat.completions.create.side_effect = [
+            make_response(content="first answer"),
+            make_response(content="second answer"),
+        ]
+        common = [
+            "--session-file",
+            str(session_path),
+            "--progress-file",
+            str(progress_path),
+            "--log-file",
+            str(log_path),
+            "--approval-policy",
+            "deny",
+        ]
+
+        with patch.dict(harness.os.environ, {"CEREBRAS_API_KEY": "key"}), patch(
+            "harness.Cerebras", return_value=client
+        ), redirect_stdout(io.StringIO()):
+            first_exit = harness.main([*common, "first question"])
+            second_exit = harness.main([*common, "--resume", "second question"])
+
+        self.assertEqual((first_exit, second_exit), (0, 0))
+        session_id, messages = harness.SessionStore(
+            session_path, self.root
+        ).load()
+        self.assertEqual(
+            [message["content"] for message in messages if message["role"] == "user"],
+            ["first question", "second question"],
+        )
+        events = [
+            json.loads(line)
+            for line in log_path.read_text(encoding="utf-8").splitlines()
+        ]
+        starts = [event for event in events if event["event"] == "session_started"]
+        self.assertEqual([event["resumed"] for event in starts], [False, True])
+        self.assertTrue(all(event["session_id"] == session_id for event in starts))
 
 
 class MetricsTests(unittest.TestCase):
