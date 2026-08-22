@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Stage 4: a small, approval-gated coding agent backed by Cerebras."""
+"""Stage 5: a context-aware, approval-gated coding agent backed by Cerebras."""
 
 from __future__ import annotations
 
 import argparse
 import ast
+import copy
 import json
 import math
 import os
@@ -30,9 +31,21 @@ from rich.markdown import Markdown
 DEFAULT_CONTEXT_WINDOW = 131_072
 DEFAULT_MAX_TURNS = 8
 DEFAULT_TIMEOUT_SECONDS = 30.0
+DEFAULT_COMPACTION_THRESHOLD = 0.70
+DEFAULT_RECENT_TURNS = 2
+DEFAULT_RELEVANT_FILES = 8
+DEFAULT_SESSION_FILE = Path(".harness/session.json")
+DEFAULT_PROGRESS_FILE = Path(".harness/progress.md")
+SESSION_SCHEMA_VERSION = 1
+PRIVATE_RUNTIME_PATHS: set[str] = set()
 MAX_LISTED_FILES = 500
 MAX_READ_LINES = 200
 MAX_TOOL_OUTPUT_CHARS = 16_000
+MAX_CONTEXT_TOOL_OUTPUT_CHARS = 4_000
+MAX_INSTRUCTION_FILE_CHARS = 24_000
+MAX_INSTRUCTION_CONTEXT_CHARS = 64_000
+MAX_COMPACTION_SUMMARY_CHARS = 8_000
+MAX_PROGRESS_CHARS = 8_000
 MAX_SEARCH_RESULTS = 50
 MAX_SEARCH_LINE_CHARS = 240
 MAX_SEARCH_FILE_BYTES = 1_000_000
@@ -67,8 +80,10 @@ DEFAULT_SYSTEM_PROMPT = (
     "before editing, use apply_patch for changes, and use run_shell only for an "
     "allowlisted command. Editing and shell execution are approval-gated. Shell "
     "commands run in a disposable repository copy, so their filesystem changes "
-    "do not persist. Tool results may be truncated; request narrower output when "
-    "needed."
+    "do not persist. Follow every supplied AGENTS.md instruction, with deeper "
+    "repository instructions taking precedence. Use the suggested relevant-file "
+    "paths as an index and read only what the task needs. Tool results and older "
+    "history may be summarized; re-read source files when exact details matter."
 )
 
 
@@ -163,7 +178,9 @@ TOOLS = [
             "name": "read_file",
             "description": (
                 "Read a bounded line range from a UTF-8 repository file. "
-                f"At most {MAX_READ_LINES} lines are accepted per call."
+                f"At most {MAX_READ_LINES} lines are accepted per call. Reports "
+                "applicable AGENTS.md paths; read nested instructions before "
+                "modifying files in their scope."
             ),
             "strict": True,
             "parameters": {
@@ -351,6 +368,14 @@ def positive_float(value: str) -> float:
     return number
 
 
+def ratio_float(value: str) -> float:
+    """Parse a finite ratio strictly between zero and one."""
+    number = positive_float(value)
+    if number >= 1:
+        raise argparse.ArgumentTypeError("must be less than one")
+    return number
+
+
 class JsonlEventLogger:
     """Append structured session events to a JSON Lines file."""
 
@@ -358,6 +383,12 @@ class JsonlEventLogger:
         self.path = path
         self.session_id = session_id or str(uuid.uuid4())
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            PRIVATE_RUNTIME_PATHS.add(
+                self.path.resolve().relative_to(Path.cwd().resolve()).as_posix()
+            )
+        except ValueError:
+            pass
 
     def log(self, event: str, **data: Any) -> None:
         record = {
@@ -412,10 +443,62 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--compaction-threshold",
+        type=ratio_float,
+        default=DEFAULT_COMPACTION_THRESHOLD,
+        help=(
+            "Compact old history above this estimated context ratio "
+            f"(default: {DEFAULT_COMPACTION_THRESHOLD:g})."
+        ),
+    )
+    parser.add_argument(
+        "--keep-recent-turns",
+        type=positive_int,
+        default=DEFAULT_RECENT_TURNS,
+        help=(
+            "Complete user turns retained verbatim during compaction "
+            f"(default: {DEFAULT_RECENT_TURNS})."
+        ),
+    )
+    parser.add_argument(
+        "--relevant-files",
+        type=positive_int,
+        default=DEFAULT_RELEVANT_FILES,
+        help=(
+            "Maximum repository paths suggested to the model per user turn "
+            f"(default: {DEFAULT_RELEVANT_FILES})."
+        ),
+    )
+    parser.add_argument(
         "--log-file",
         type=Path,
         default=Path("events.jsonl"),
         help="JSON Lines event log (default: events.jsonl).",
+    )
+    parser.add_argument(
+        "--session-file",
+        type=Path,
+        default=DEFAULT_SESSION_FILE,
+        help=f"Durable conversation state (default: {DEFAULT_SESSION_FILE}).",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume messages and session identity from --session-file.",
+    )
+    parser.add_argument(
+        "--progress-file",
+        type=Path,
+        default=DEFAULT_PROGRESS_FILE,
+        help=f"Long-running task notes (default: {DEFAULT_PROGRESS_FILE}).",
+    )
+    parser.add_argument(
+        "--global-instructions",
+        type=Path,
+        help=(
+            "Global instruction file. Defaults to $HARNESS_HOME/AGENTS.md or "
+            "~/.harness/AGENTS.md when present."
+        ),
     )
     parser.add_argument(
         "--approval-policy",
@@ -438,6 +521,471 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Initial system instruction included in every conversation.",
     )
     return parser.parse_args(argv)
+
+
+def _default_global_instruction_path() -> Path:
+    harness_home = os.environ.get("HARNESS_HOME")
+    base = Path(harness_home).expanduser() if harness_home else Path.home() / ".harness"
+    return base / "AGENTS.md"
+
+
+def _read_context_file(path: Path, maximum: int = MAX_INSTRUCTION_FILE_CHARS) -> str:
+    """Read a bounded UTF-8 context file, marking truncation explicitly."""
+    try:
+        content = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise RuntimeError(f"could not read context file {path}: {exc}") from exc
+    if len(content) <= maximum:
+        return content.rstrip()
+    marker = f"\n\n[truncated after {maximum} of {len(content)} characters]"
+    return content[: maximum - len(marker)].rstrip() + marker
+
+
+def _instruction_paths_for_files(
+    repository_root: Path,
+    relevant_files: list[str] | None = None,
+) -> list[Path]:
+    """Find root and nested AGENTS.md files that govern selected paths."""
+    root = repository_root.resolve()
+    candidates = {root / "AGENTS.md"}
+    for relative_name in relevant_files or []:
+        candidate = (root / relative_name).resolve()
+        try:
+            relative = candidate.relative_to(root)
+        except ValueError:
+            continue
+        parent = relative.parent
+        while parent != Path("."):
+            candidates.add(root / parent / "AGENTS.md")
+            parent = parent.parent
+    return sorted(
+        (
+            path
+            for path in candidates
+            if path.is_file() and not path.is_symlink()
+        ),
+        key=lambda path: (len(path.relative_to(root).parts), path.as_posix()),
+    )
+
+
+def load_instruction_documents(
+    repository_root: Path,
+    global_path: Path | None = None,
+    relevant_files: list[str] | None = None,
+    include_global: bool = True,
+) -> list[tuple[str, str]]:
+    """Load global and applicable repository instructions in precedence order."""
+    documents: list[tuple[str, str]] = []
+    if include_global:
+        requested_global = global_path or _default_global_instruction_path()
+        requested_global = requested_global.expanduser()
+        if requested_global.is_file():
+            documents.append(
+                (str(requested_global), _read_context_file(requested_global))
+            )
+
+    root = repository_root.resolve()
+    for path in _instruction_paths_for_files(root, relevant_files):
+        label = path.relative_to(root).as_posix()
+        documents.append((label, _read_context_file(path)))
+    total_characters = sum(len(content) for _label, content in documents)
+    if total_characters <= MAX_INSTRUCTION_CONTEXT_CHARS:
+        return documents
+
+    per_document = MAX_INSTRUCTION_CONTEXT_CHARS // len(documents)
+    bounded_documents: list[tuple[str, str]] = []
+    for label, content in documents:
+        marker = f"\n\n[{label} truncated for total instruction budget]"
+        if len(content) > per_document:
+            content = content[: per_document - len(marker)].rstrip() + marker
+        bounded_documents.append((label, content))
+    return bounded_documents
+
+
+def build_system_prompt(
+    base_prompt: str,
+    instruction_documents: list[tuple[str, str]],
+    progress: str | None = None,
+) -> str:
+    """Compose clearly delimited durable context without flattening precedence."""
+    sections = [base_prompt.rstrip()]
+    if instruction_documents:
+        sections.append(
+            "## Instructions\n\n"
+            "Follow these documents in order. A later, more specific repository "
+            "document overrides an earlier document for files in its scope."
+        )
+        for label, content in instruction_documents:
+            sections.append(f"### {label}\n\n{content}")
+    if progress:
+        sections.append(
+            "## Resumed progress\n\n"
+            "Treat these notes as potentially stale working memory and verify them "
+            f"against the repository when needed.\n\n{progress}"
+        )
+    return "\n\n".join(section for section in sections if section)
+
+
+def _task_terms(prompt: str) -> set[str]:
+    return {
+        term.lower()
+        for term in re.findall(r"[A-Za-z0-9_.\-/]+", prompt)
+        if len(term) >= 2
+    }
+
+
+def select_relevant_files(
+    prompt: str, limit: int = DEFAULT_RELEVANT_FILES
+) -> list[str]:
+    """Rank repository paths by task terms without loading their contents."""
+    if limit <= 0:
+        return []
+    root = _repository_root()
+    terms = _task_terms(prompt)
+    scored: list[tuple[int, int, str]] = []
+    for path in _visible_files(root):
+        relative = path.relative_to(root).as_posix()
+        lowered = relative.lower()
+        name = path.name.lower()
+        stem = path.stem.lower()
+        score = 0
+        for term in terms:
+            normalized = term.strip("./")
+            if not normalized:
+                continue
+            if normalized == lowered:
+                score += 20
+            elif normalized in lowered:
+                score += 6
+            if normalized in {name, stem}:
+                score += 8
+        if "test" in terms and ("tests/" in lowered or name.startswith("test_")):
+            score += 5
+        if "readme" in terms and name == "readme.md":
+            score += 5
+        if score:
+            scored.append((score, -len(relative), relative))
+    scored.sort(reverse=True)
+    return [relative for _score, _length, relative in scored[:limit]]
+
+
+def _turn_context_message(
+    prompt: str, limit: int
+) -> tuple[dict[str, str] | None, list[str]]:
+    relevant_files = select_relevant_files(prompt, limit)
+    if not relevant_files:
+        return None, []
+    root = _repository_root()
+    nested_documents = [
+        (label, content)
+        for label, content in load_instruction_documents(
+            root,
+            relevant_files=relevant_files,
+            include_global=False,
+        )
+        if label != "AGENTS.md"
+    ]
+    lines = [
+        "## Just-in-time repository context",
+        "Likely relevant paths (hints, not authoritative; inspect before editing):",
+        *(f"- {path}" for path in relevant_files),
+    ]
+    for label, content in nested_documents:
+        lines.extend(("", f"### Applicable {label}", content))
+    return {"role": "system", "content": "\n".join(lines)}, relevant_files
+
+
+def _request_messages(
+    messages: list[dict[str, Any]], context_message: dict[str, str] | None
+) -> list[dict[str, Any]]:
+    """Add ephemeral retrieval context without polluting durable history."""
+    if context_message is None:
+        return messages
+    if messages and messages[0].get("role") == "system":
+        return [messages[0], context_message, *messages[1:]]
+    return [context_message, *messages]
+
+
+def summarize_tool_output(
+    result: dict[str, Any], maximum: int = MAX_CONTEXT_TOOL_OUTPUT_CHARS
+) -> tuple[str, bool]:
+    """Serialize a tool result, replacing oversized payloads with head/tail context."""
+    raw = json.dumps(result, ensure_ascii=False)
+    if len(raw) <= maximum:
+        return raw, False
+    preview_budget = max(100, (maximum - 300) // 2)
+    summary = {
+        "ok": result.get("ok"),
+        "context_summary": True,
+        "original_characters": len(raw),
+        "head": raw[:preview_budget],
+        "tail": raw[-preview_budget:],
+        "notice": (
+            "Middle omitted from model context; rerun a narrower query if needed."
+        ),
+    }
+    serialized = json.dumps(summary, ensure_ascii=False)
+    while len(serialized) > maximum and preview_budget > 50:
+        preview_budget -= max(10, (len(serialized) - maximum + 1) // 2)
+        summary["head"] = raw[:preview_budget]
+        summary["tail"] = raw[-preview_budget:]
+        serialized = json.dumps(summary, ensure_ascii=False)
+    return serialized, True
+
+
+def _estimate_context_tokens(messages: list[dict[str, Any]]) -> int:
+    serialized = json.dumps(messages, ensure_ascii=False, separators=(",", ":"))
+    return math.ceil(len(serialized) / 4)
+
+
+def _summary_line(message: dict[str, Any]) -> str:
+    role = str(message.get("role", "unknown"))
+    content = message.get("content")
+    text = content if isinstance(content, str) else ""
+    text = " ".join(text.split())
+    maximum = 1_200 if role in {"user", "assistant", "system"} else 500
+    if len(text) > maximum:
+        text = text[: maximum - 18] + " … [truncated]"
+    if role == "assistant" and message.get("tool_calls"):
+        names = [
+            call.get("function", {}).get("name", "unknown")
+            for call in message["tool_calls"]
+        ]
+        text = f"requested tools: {', '.join(names)}; {text}".strip("; ")
+    if role == "tool":
+        role = f"tool:{message.get('name', 'unknown')}"
+    return f"- {role}: {text or '[no text]'}"
+
+
+def compact_history(
+    messages: list[dict[str, Any]], keep_recent_turns: int = DEFAULT_RECENT_TURNS
+) -> dict[str, int] | None:
+    """Replace complete older turns with a bounded, high-recall working summary."""
+    first_history_index = 1 if messages and messages[0].get("role") == "system" else 0
+    user_indices = [
+        index
+        for index in range(first_history_index, len(messages))
+        if messages[index].get("role") == "user"
+    ]
+    if len(user_indices) <= keep_recent_turns:
+        return None
+    keep_start = user_indices[-keep_recent_turns]
+    old_messages = messages[first_history_index:keep_start]
+    if not old_messages:
+        return None
+    summary = "## Compacted conversation\n\n" + "\n".join(
+        _summary_line(message) for message in old_messages
+    )
+    if len(summary) > MAX_COMPACTION_SUMMARY_CHARS:
+        omitted = len(summary) - MAX_COMPACTION_SUMMARY_CHARS
+        marker = f"\n- [earlier summary shortened by {omitted} characters]\n"
+        head_size = (MAX_COMPACTION_SUMMARY_CHARS - len(marker)) // 2
+        summary = summary[:head_size] + marker + summary[-head_size:]
+    retained = messages[:first_history_index] + [
+        {"role": "system", "content": summary}
+    ] + messages[keep_start:]
+    before = len(messages)
+    messages[:] = retained
+    return {
+        "compacted_messages": len(old_messages),
+        "removed_messages": before - len(retained),
+        "summary_characters": len(summary),
+    }
+
+
+def maybe_compact_history(
+    messages: list[dict[str, Any]],
+    context_window: int,
+    threshold: float = DEFAULT_COMPACTION_THRESHOLD,
+    keep_recent_turns: int = DEFAULT_RECENT_TURNS,
+    observed_prompt_tokens: int | None = None,
+) -> dict[str, Any] | None:
+    estimated = _estimate_context_tokens(messages)
+    used = max(estimated, observed_prompt_tokens or 0)
+    if used < context_window * threshold:
+        return None
+    result = compact_history(messages, keep_recent_turns)
+    if result is None:
+        return None
+    return {"estimated_tokens_before": estimated, "trigger_tokens": used, **result}
+
+
+def _validated_runtime_path(path: Path) -> Path:
+    root = _repository_root()
+    candidate = path.expanduser()
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    candidate = candidate.resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("runtime state paths must stay inside the repository") from exc
+    return candidate
+
+
+def _atomic_write_text(path: Path, content: str, private: bool = False) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        if private:
+            temporary.chmod(0o600)
+        temporary.replace(path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+class SessionStore:
+    """Persist validated conversation state atomically for later resumption."""
+
+    def __init__(self, path: Path, repository_root: Path) -> None:
+        self.path = _validated_runtime_path(path)
+        self.repository_root = repository_root.resolve()
+        PRIVATE_RUNTIME_PATHS.add(
+            self.path.relative_to(self.repository_root).as_posix()
+        )
+
+    def save(self, session_id: str, messages: list[dict[str, Any]]) -> None:
+        payload = {
+            "schema_version": SESSION_SCHEMA_VERSION,
+            "session_id": session_id,
+            "repository_root": str(self.repository_root),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "messages": messages,
+        }
+        _atomic_write_text(
+            self.path,
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            private=True,
+        )
+
+    def ensure_safe_to_replace(self) -> None:
+        """Reject overwriting an existing file that is not our session format."""
+        if not self.path.exists():
+            return
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"refusing to overwrite non-session file: {self.path}"
+            ) from exc
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema_version") != SESSION_SCHEMA_VERSION
+            or payload.get("repository_root") != str(self.repository_root)
+        ):
+            raise RuntimeError(f"refusing to overwrite non-session file: {self.path}")
+
+    def load(self) -> tuple[str, list[dict[str, Any]]]:
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"session file does not exist: {self.path}") from exc
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"could not load session file {self.path}: {exc}"
+            ) from exc
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema_version") != SESSION_SCHEMA_VERSION
+        ):
+            raise RuntimeError("unsupported or malformed session file")
+        if payload.get("repository_root") != str(self.repository_root):
+            raise RuntimeError("session belongs to a different repository")
+        session_id = payload.get("session_id")
+        messages = payload.get("messages")
+        if not isinstance(session_id, str) or not session_id:
+            raise RuntimeError("session file has no valid session_id")
+        if not isinstance(messages, list) or any(
+            not isinstance(message, dict)
+            or message.get("role") not in {"system", "user", "assistant", "tool"}
+            for message in messages
+        ):
+            raise RuntimeError("session file has malformed messages")
+        return session_id, messages
+
+
+class ProgressTracker:
+    """Maintain compact, durable notes for interrupted long-running work."""
+
+    def __init__(
+        self, path: Path, session_id: str, load_existing: bool = True
+    ) -> None:
+        self.path = _validated_runtime_path(path)
+        self.session_id = session_id
+        self.objective = ""
+        self.status = "idle"
+        self.actions: list[str] = []
+        if self.path.is_file():
+            try:
+                with self.path.open(encoding="utf-8") as stream:
+                    first_line = stream.readline().rstrip()
+            except (OSError, UnicodeError) as exc:
+                raise ValueError(
+                    f"could not validate progress file: {self.path}"
+                ) from exc
+            if first_line != "# Harness progress":
+                raise ValueError(
+                    f"refusing to overwrite non-progress file: {self.path}"
+                )
+        if load_existing and self.path.is_file():
+            try:
+                previous = _read_context_file(self.path, MAX_PROGRESS_CHARS)
+            except RuntimeError:
+                previous = ""
+            objective_match = re.search(
+                r"## Current objective\s+(.*?)(?=\n## |\Z)", previous, re.DOTALL
+            )
+            if objective_match:
+                self.objective = objective_match.group(1).strip()
+            actions_match = re.search(
+                r"## Recent actions\s+(.*?)(?=\n## |\Z)", previous, re.DOTALL
+            )
+            if actions_match:
+                self.actions = [
+                    line[2:].strip()
+                    for line in actions_match.group(1).splitlines()
+                    if line.startswith("- ") and line != "- None yet."
+                ][-20:]
+
+    def _write(self) -> None:
+        actions = self.actions[-20:]
+        content = (
+            "# Harness progress\n\n"
+            f"- Session: `{self.session_id}`\n"
+            f"- Updated: {datetime.now(timezone.utc).isoformat()}\n"
+            f"- Status: {self.status}\n\n"
+            f"## Current objective\n\n{self.objective or 'Not set.'}\n\n"
+            "## Recent actions\n\n"
+            + ("\n".join(f"- {action}" for action in actions) or "- None yet.")
+            + "\n"
+        )
+        _atomic_write_text(self.path, content[:MAX_PROGRESS_CHARS])
+
+    def start(self, prompt: str) -> None:
+        if not self.objective:
+            self.objective = " ".join(prompt.split())[:2_000]
+        self.status = "in progress"
+        self.actions.append("Started a user turn.")
+        self._write()
+
+    def record_tool(self, name: str, success: bool) -> None:
+        self.actions.append(f"Tool `{name}` {'completed' if success else 'failed'}.")
+        self._write()
+
+    def complete(self, answer: str) -> None:
+        condensed = " ".join(answer.split())
+        if len(condensed) > 1_000:
+            condensed = condensed[:982] + " … [truncated]"
+        self.actions.append(f"Turn completed: {condensed or '[empty response]'}")
+        self.status = "turn completed"
+        self._write()
+
+    def failed(self, error: BaseException) -> None:
+        self.actions.append(f"Turn interrupted: {type(error).__name__}: {error}")
+        self.status = "interrupted"
+        self._write()
 
 
 def _cached_token_count(usage: Any) -> int | None:
@@ -616,6 +1164,16 @@ def _repository_root() -> Path:
 def _is_sensitive_path(path: Path) -> bool:
     if any(part in EXCLUDED_DIRECTORY_NAMES for part in path.parts):
         return True
+    if path.as_posix() in PRIVATE_RUNTIME_PATHS:
+        return True
+    if path.as_posix() == DEFAULT_SESSION_FILE.as_posix():
+        return True
+    if path.name == "events.jsonl":
+        return True
+    if path.parent.as_posix() == DEFAULT_SESSION_FILE.parent.as_posix() and (
+        path.name.startswith(f".{DEFAULT_SESSION_FILE.name}.")
+    ):
+        return True
     return any(
         part == ".env" or (part.startswith(".env.") and part != ".env.example")
         for part in path.parts
@@ -759,6 +1317,12 @@ def read_file(arguments: dict[str, Any]) -> dict[str, Any]:
         "\n".join(selected), max_lines=max_lines
     )
     returned_lines = len(content.splitlines()) if content else 0
+    instruction_files = [
+        path.relative_to(_repository_root()).as_posix()
+        for path in _instruction_paths_for_files(
+            _repository_root(), [display_path]
+        )
+    ]
     return {
         "path": display_path,
         "start_line": start_line,
@@ -768,6 +1332,7 @@ def read_file(arguments: dict[str, Any]) -> dict[str, Any]:
         "next_start_line": (
             start_line + returned_lines if has_more and not character_truncated else None
         ),
+        "applicable_instruction_files": instruction_files,
     }
 
 
@@ -1540,19 +2105,28 @@ def run_turn(
     prompt: str,
     args: argparse.Namespace,
     event_logger: JsonlEventLogger,
+    session_store: SessionStore | None = None,
+    progress_tracker: ProgressTracker | None = None,
 ) -> int:
     """Run model/tool turns until the model answers or a guardrail stops it."""
-    history_start = len(messages)
+    history_snapshot = copy.deepcopy(messages)
     user_message = {"role": "user", "content": prompt}
     messages.append(user_message)
+    relevant_limit = getattr(args, "relevant_files", DEFAULT_RELEVANT_FILES)
+    context_message, relevant_files = _turn_context_message(prompt, relevant_limit)
     event_logger.log(
         "user_message",
         content=prompt,
         history_message_count=len(messages),
+        relevant_files=relevant_files,
     )
     max_turns = getattr(args, "max_turns", DEFAULT_MAX_TURNS)
     timeout_seconds = getattr(args, "timeout", DEFAULT_TIMEOUT_SECONDS)
     approval_policy = getattr(args, "approval_policy", "deny")
+    compaction_threshold = getattr(
+        args, "compaction_threshold", DEFAULT_COMPACTION_THRESHOLD
+    )
+    keep_recent_turns = getattr(args, "keep_recent_turns", DEFAULT_RECENT_TURNS)
     started_at = time.monotonic()
     deadline = started_at + timeout_seconds
     responses: list[Any] = []
@@ -1564,6 +2138,8 @@ def run_turn(
         sandbox=getattr(args, "sandbox", "disposable"),
         available_tools=sorted(TOOL_HANDLERS),
     )
+    if progress_tracker is not None:
+        progress_tracker.start(prompt)
 
     def request_approval(name: str, arguments: dict[str, Any]) -> bool:
         summary = _approval_summary(name, arguments)
@@ -1583,6 +2159,27 @@ def run_turn(
 
     try:
         for turn_number in range(1, max_turns + 1):
+            observed_prompt_tokens = None
+            if responses:
+                observed_prompt_tokens = getattr(
+                    getattr(responses[-1], "usage", None), "prompt_tokens", None
+                )
+            compaction = maybe_compact_history(
+                messages,
+                args.context_window,
+                threshold=compaction_threshold,
+                keep_recent_turns=keep_recent_turns,
+                observed_prompt_tokens=observed_prompt_tokens,
+            )
+            if compaction is not None:
+                event_logger.log(
+                    "conversation_context_compacted",
+                    turn=turn_number,
+                    history_message_count=len(messages),
+                    **compaction,
+                )
+                if session_store is not None:
+                    session_store.save(event_logger.session_id, messages)
             remaining = _remaining_seconds(deadline)
             event_logger.log(
                 "agent_turn_started",
@@ -1601,10 +2198,11 @@ def run_turn(
             )
 
             request_started_at = time.monotonic()
+            api_messages = _request_messages(messages, context_message)
             try:
                 response = client.chat.completions.create(
                     model=args.model,
-                    messages=messages,
+                    messages=api_messages,
                     reasoning_effort=args.reasoning_effort,
                     max_completion_tokens=args.max_completion_tokens,
                     tools=TOOLS,
@@ -1660,6 +2258,10 @@ def run_turn(
 
             if not tool_calls:
                 messages.append({"role": "assistant", "content": content})
+                if session_store is not None:
+                    session_store.save(event_logger.session_id, messages)
+                if progress_tracker is not None:
+                    progress_tracker.complete(content)
                 event_logger.log(
                     "agent_decision",
                     turn=turn_number,
@@ -1745,12 +2347,13 @@ def run_turn(
                 elapsed_ms = round(
                     (time.monotonic() - tool_started_at) * 1_000, 2
                 )
+                context_result, result_summarized = summarize_tool_output(result)
                 messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": call_id,
                         "name": name,
-                        "content": json.dumps(result, ensure_ascii=False),
+                        "content": context_result,
                     }
                 )
                 event_logger.log(
@@ -1760,10 +2363,15 @@ def run_turn(
                     tool=name,
                     success=result["ok"],
                     result=result,
+                    context_result_summarized=result_summarized,
                     latency_ms=elapsed_ms,
                     history_message_count=len(messages),
                 )
+                if progress_tracker is not None:
+                    progress_tracker.record_tool(name, result["ok"])
                 _remaining_seconds(deadline)
+            if session_store is not None:
+                session_store.save(event_logger.session_id, messages)
 
         _remaining_seconds(deadline)
         event_logger.log(
@@ -1776,7 +2384,11 @@ def run_turn(
             f"agent did not produce a final response within {max_turns} model turns"
         )
     except (Exception, KeyboardInterrupt) as exc:
-        del messages[history_start:]
+        messages[:] = history_snapshot
+        if session_store is not None:
+            session_store.save(event_logger.session_id, messages)
+        if progress_tracker is not None:
+            progress_tracker.failed(exc)
         event_logger.log(
             "agent_loop_failed",
             error_type=type(exc).__name__,
@@ -1790,6 +2402,7 @@ def run_turn(
 def clear_conversation_context(
     messages: list[dict[str, Any]],
     event_logger: JsonlEventLogger,
+    session_store: SessionStore | None = None,
 ) -> int:
     """Remove conversation turns while preserving the initial system prompt."""
     retained_messages = (
@@ -1802,6 +2415,8 @@ def clear_conversation_context(
         removed_message_count=removed_count,
         history_message_count=len(messages),
     )
+    if session_store is not None:
+        session_store.save(event_logger.session_id, messages)
     return removed_count
 
 
@@ -1810,6 +2425,8 @@ def interactive_cli(
     messages: list[dict[str, Any]],
     args: argparse.Namespace,
     event_logger: JsonlEventLogger,
+    session_store: SessionStore | None = None,
+    progress_tracker: ProgressTracker | None = None,
 ) -> int:
     """Read questions until the user exits, retaining successful turns."""
     if not sys.stdin.isatty():
@@ -1819,7 +2436,7 @@ def interactive_cli(
         )
         return 2
 
-    print("Harness Stage 4. Type /help for help or /exit to quit.")
+    print("Harness Stage 5. Type /help for help or /exit to quit.")
     while True:
         try:
             prompt = input("\nyou> ").strip()
@@ -1835,18 +2452,48 @@ def interactive_cli(
         if prompt in {"/exit", "/quit"}:
             return 0
         if prompt == "/help":
-            print("Ask a question. Commands: /clear, /help, /exit, /quit")
+            print(
+                "Ask a question. Commands: /clear, /compact, /help, /exit, /quit"
+            )
             continue
         if prompt == "/clear":
-            removed_count = clear_conversation_context(messages, event_logger)
+            removed_count = clear_conversation_context(
+                messages, event_logger, session_store
+            )
             print(
                 "Conversation context cleared "
                 f"({removed_count} message{'s' if removed_count != 1 else ''} removed)."
             )
             continue
+        if prompt == "/compact":
+            result = compact_history(
+                messages,
+                getattr(args, "keep_recent_turns", DEFAULT_RECENT_TURNS),
+            )
+            if session_store is not None:
+                session_store.save(event_logger.session_id, messages)
+            if result is None:
+                print("Nothing old enough to compact.")
+            else:
+                event_logger.log(
+                    "conversation_context_compacted",
+                    manual=True,
+                    history_message_count=len(messages),
+                    **result,
+                )
+                print(f"Compacted {result['compacted_messages']} older messages.")
+            continue
 
         try:
-            run_turn(client, messages, prompt, args, event_logger)
+            run_turn(
+                client,
+                messages,
+                prompt,
+                args,
+                event_logger,
+                session_store,
+                progress_tracker,
+            )
         except KeyboardInterrupt:
             print("\nRequest interrupted.", file=sys.stderr)
         except Exception as exc:
@@ -1856,7 +2503,46 @@ def interactive_cli(
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     load_dotenv(Path(__file__).resolve().with_name(".env"), override=False)
-    event_logger = JsonlEventLogger(args.log_file)
+    root = _repository_root()
+    session_id = str(uuid.uuid4())
+    try:
+        session_store = SessionStore(args.session_file, root)
+        if args.resume:
+            session_id, messages = session_store.load()
+        else:
+            session_store.ensure_safe_to_replace()
+            messages = []
+        progress_path = _validated_runtime_path(args.progress_file)
+        progress_context = (
+            _read_context_file(progress_path, MAX_PROGRESS_CHARS)
+            if args.resume and progress_path.is_file()
+            else None
+        )
+        instruction_documents = load_instruction_documents(
+            root, args.global_instructions
+        )
+        system_prompt = build_system_prompt(
+            args.system_prompt,
+            instruction_documents,
+            progress_context,
+        )
+        if messages and messages[0].get("role") == "system":
+            messages[0] = {"role": "system", "content": system_prompt}
+        else:
+            messages.insert(0, {"role": "system", "content": system_prompt})
+        progress_tracker = ProgressTracker(
+            args.progress_file, session_id, load_existing=args.resume
+        )
+        session_store.save(session_id, messages)
+    except (OSError, RuntimeError, ValueError) as exc:
+        event_logger = JsonlEventLogger(args.log_file, session_id)
+        message = f"could not initialize context state: {exc}"
+        event_logger.log("configuration_error", message=message)
+        event_logger.log("session_ended", exit_code=2)
+        print(f"Error: {message}", file=sys.stderr)
+        return 2
+
+    event_logger = JsonlEventLogger(args.log_file, session_id)
     event_logger.log(
         "session_started",
         model=args.model,
@@ -1867,6 +2553,10 @@ def main(argv: list[str] | None = None) -> int:
         sandbox=args.sandbox,
         available_tools=sorted(TOOL_HANDLERS),
         interactive=args.prompt is None,
+        resumed=args.resume,
+        session_file=str(session_store.path),
+        progress_file=str(progress_tracker.path),
+        instruction_files=[label for label, _content in instruction_documents],
     )
 
     exit_code = 1
@@ -1878,13 +2568,25 @@ def main(argv: list[str] | None = None) -> int:
             exit_code = 2
         else:
             client = Cerebras(api_key=os.environ["CEREBRAS_API_KEY"])
-            messages = [{"role": "system", "content": args.system_prompt}]
             if args.prompt is None:
-                exit_code = interactive_cli(client, messages, args, event_logger)
+                exit_code = interactive_cli(
+                    client,
+                    messages,
+                    args,
+                    event_logger,
+                    session_store,
+                    progress_tracker,
+                )
             else:
                 try:
                     exit_code = run_turn(
-                        client, messages, args.prompt, args, event_logger
+                        client,
+                        messages,
+                        args.prompt,
+                        args,
+                        event_logger,
+                        session_store,
+                        progress_tracker,
                     )
                 except KeyboardInterrupt:
                     print("\nRequest interrupted.", file=sys.stderr)
