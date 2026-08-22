@@ -1,6 +1,7 @@
 import argparse
 import io
 import json
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -100,10 +101,22 @@ class ParseArgsTests(unittest.TestCase):
 
 
 class ToolTests(unittest.TestCase):
-    def test_declares_three_strict_input_schemas(self):
+    def test_declares_strict_input_schemas_for_stage_three_tools(self):
         names = {tool["function"]["name"] for tool in harness.TOOLS}
 
-        self.assertEqual(names, {"calculator", "get_current_time", "echo"})
+        self.assertEqual(
+            names,
+            {
+                "calculator",
+                "get_current_time",
+                "echo",
+                "list_files",
+                "read_file",
+                "search_text",
+                "git_diff",
+                "run_tests",
+            },
+        )
         for tool in harness.TOOLS:
             function = tool["function"]
             self.assertTrue(function["strict"])
@@ -143,6 +156,181 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(malformed["error"]["type"], "ToolArgumentError")
         self.assertFalse(unknown["ok"])
         self.assertIn("unknown tool", unknown["error"]["message"])
+
+
+class RepositoryToolTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.root = Path(self.temp_dir.name).resolve()
+        self.root_patch = patch("harness._repository_root", return_value=self.root)
+        self.root_patch.start()
+        self.addCleanup(self.root_patch.stop)
+
+    def write_text(self, relative_path, content):
+        path = self.root / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    def test_list_files_is_sorted_bounded_and_excludes_sensitive_paths(self):
+        self.write_text("src/z.py", "z")
+        self.write_text("src/a.py", "a")
+        self.write_text(".env", "SECRET=value")
+        self.write_text(".env.example", "SECRET=example")
+        self.write_text(".git/config", "git")
+        self.write_text(".venv/ignored.py", "ignored")
+
+        result = harness.list_files({"path": "."})
+
+        self.assertEqual(
+            result["files"], [".env.example", "src/a.py", "src/z.py"]
+        )
+        self.assertFalse(result["truncated"])
+        self.assertEqual(result["total_count"], 3)
+
+    def test_list_files_reports_truncation(self):
+        with patch("harness.MAX_LISTED_FILES", 2):
+            for name in ("c.py", "a.py", "b.py"):
+                self.write_text(name, name)
+
+            result = harness.list_files({"path": "."})
+
+        self.assertEqual(result["files"], ["a.py", "b.py"])
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["total_count"], 3)
+
+    def test_read_file_selects_a_bounded_line_range(self):
+        self.write_text("module.py", "one\ntwo\nthree\nfour\n")
+
+        result = harness.read_file(
+            {"path": "module.py", "start_line": 2, "max_lines": 2}
+        )
+
+        self.assertEqual(result["content"], "two\nthree")
+        self.assertEqual(result["end_line"], 3)
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["next_start_line"], 4)
+
+    def test_read_file_rejects_traversal_sensitive_files_and_oversized_ranges(self):
+        self.write_text(".env", "SECRET=value")
+        outside_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(outside_dir.cleanup)
+        outside_path = Path(outside_dir.name) / "outside.py"
+        outside_path.write_text("outside", encoding="utf-8")
+        (self.root / "escape.py").symlink_to(outside_path)
+
+        invalid_arguments = [
+            {"path": "../outside.py", "start_line": 1, "max_lines": 20},
+            {"path": "escape.py", "start_line": 1, "max_lines": 20},
+            {"path": ".env", "start_line": 1, "max_lines": 20},
+            {
+                "path": "missing.py",
+                "start_line": 1,
+                "max_lines": harness.MAX_READ_LINES + 1,
+            },
+        ]
+        for arguments in invalid_arguments:
+            with self.subTest(arguments=arguments), self.assertRaises(
+                harness.ToolArgumentError
+            ):
+                harness.read_file(arguments)
+
+    def test_read_file_truncates_an_extremely_long_line(self):
+        self.write_text("large.txt", "x" * (harness.MAX_TOOL_OUTPUT_CHARS + 10))
+
+        result = harness.read_file(
+            {"path": "large.txt", "start_line": 1, "max_lines": 1}
+        )
+
+        self.assertEqual(len(result["content"]), harness.MAX_TOOL_OUTPUT_CHARS)
+        self.assertTrue(result["truncated"])
+        self.assertIsNone(result["next_start_line"])
+
+    def test_search_text_returns_locations_and_stops_at_its_limit(self):
+        content = "".join(f"needle {index}\n" for index in range(55))
+        self.write_text("many.txt", content)
+
+        result = harness.search_text({"query": "needle", "path": "."})
+
+        self.assertEqual(result["returned_count"], harness.MAX_SEARCH_RESULTS)
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["matches"][0]["line"], 1)
+        self.assertEqual(result["matches"][-1]["line"], 50)
+
+    def test_search_text_skips_binary_and_large_files(self):
+        (self.root / "binary.dat").write_bytes(b"needle\xff")
+        (self.root / "large.txt").write_bytes(
+            b"needle" + b"x" * harness.MAX_SEARCH_FILE_BYTES
+        )
+        self.write_text("source.py", "value = 'needle'\n")
+
+        result = harness.search_text({"query": "needle", "path": "."})
+
+        self.assertEqual(result["returned_count"], 1)
+        self.assertEqual(result["matches"][0]["path"], "source.py")
+        self.assertEqual(result["skipped_files"], 2)
+
+    @patch("harness.subprocess.run")
+    def test_git_diff_uses_a_non_shell_command_and_truncates_output(self, run):
+        run.return_value = SimpleNamespace(
+            returncode=0,
+            stdout="\n".join(f"diff line {index}" for index in range(500)),
+        )
+
+        result = harness.git_diff({"path": "deleted.py"})
+
+        command = run.call_args.args[0]
+        self.assertEqual(
+            command[:5],
+            ["git", "diff", "--no-ext-diff", "--no-color", "HEAD"],
+        )
+        self.assertEqual(command[-2:], ["--", "deleted.py"])
+        self.assertNotIn("shell", run.call_args.kwargs)
+        self.assertTrue(result["truncated"])
+        self.assertLessEqual(
+            len(result["output"].splitlines()), harness.MAX_PROCESS_OUTPUT_LINES
+        )
+
+    @patch("harness.subprocess.run")
+    def test_run_tests_uses_the_repository_virtual_environment(self, run):
+        python = self.root / ".venv/bin/python"
+        python.parent.mkdir(parents=True)
+        python.touch()
+        run.return_value = SimpleNamespace(returncode=1, stdout="failure details")
+
+        result = harness.run_tests({})
+
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                str(python),
+                "-m",
+                "unittest",
+                "discover",
+                "-s",
+                "tests",
+                "-v",
+            ],
+        )
+        self.assertEqual(result["exit_code"], 1)
+        self.assertEqual(result["output"], "failure details")
+        self.assertEqual(run.call_args.kwargs["timeout"], harness.TEST_TIMEOUT_SECONDS)
+
+    @patch(
+        "harness.subprocess.run",
+        side_effect=subprocess.TimeoutExpired(["tests"], 60, output="partial"),
+    )
+    def test_run_tests_reports_timeouts_as_bounded_results(self, _run):
+        python = self.root / ".venv/bin/python"
+        python.parent.mkdir(parents=True)
+        python.touch()
+
+        result = harness.run_tests({})
+
+        self.assertTrue(result["timed_out"])
+        self.assertIsNone(result["exit_code"])
+        self.assertEqual(result["output"], "partial")
 
 
 class MetricsTests(unittest.TestCase):

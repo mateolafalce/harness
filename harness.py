@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage 2: a small, observable agent loop backed by Cerebras."""
+"""Stage 3: a small, read-only coding agent backed by Cerebras."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import ast
 import json
 import math
 import os
+import subprocess
 import sys
 import time
 import uuid
@@ -25,9 +26,27 @@ from rich.markdown import Markdown
 DEFAULT_CONTEXT_WINDOW = 131_072
 DEFAULT_MAX_TURNS = 8
 DEFAULT_TIMEOUT_SECONDS = 30.0
+MAX_LISTED_FILES = 500
+MAX_READ_LINES = 200
+MAX_TOOL_OUTPUT_CHARS = 16_000
+MAX_SEARCH_RESULTS = 50
+MAX_SEARCH_LINE_CHARS = 240
+MAX_SEARCH_FILE_BYTES = 1_000_000
+MAX_PROCESS_OUTPUT_LINES = 400
+TEST_TIMEOUT_SECONDS = 60.0
+EXCLUDED_DIRECTORY_NAMES = {
+    ".git",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    "__pycache__",
+}
 DEFAULT_SYSTEM_PROMPT = (
-    "Respond clearly and concisely to the user's questions. Use the available "
-    "tools when they are useful, and do not invent tool results."
+    "You are a read-only coding agent. Inspect the repository with the available "
+    "tools, select only the context needed to answer, and do not claim to have "
+    "modified files. Tool results may be truncated; request a narrower path or "
+    "range when needed."
 )
 
 
@@ -90,6 +109,130 @@ TOOLS = [
                     }
                 },
                 "required": ["text"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": (
+                "Recursively list files below a repository-relative directory. "
+                f"Returns at most {MAX_LISTED_FILES} paths."
+            ),
+            "strict": True,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Repository-relative directory, such as . or tests.",
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": (
+                "Read a bounded line range from a UTF-8 repository file. "
+                f"At most {MAX_READ_LINES} lines are accepted per call."
+            ),
+            "strict": True,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Repository-relative file path.",
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "First one-based line to return.",
+                    },
+                    "max_lines": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_READ_LINES,
+                        "description": "Maximum number of lines to return.",
+                    },
+                },
+                "required": ["path", "start_line", "max_lines"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_text",
+            "description": (
+                "Search UTF-8 repository files for a literal, case-sensitive text "
+                f"fragment. Returns at most {MAX_SEARCH_RESULTS} matches."
+            ),
+            "strict": True,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "Literal text to find; regular expressions are not used."
+                        ),
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Repository-relative file or directory to search.",
+                    },
+                },
+                "required": ["query", "path"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_diff",
+            "description": (
+                "Show the staged and unstaged Git diff for a repository-relative path. "
+                "Output is bounded and external diff programs are disabled."
+            ),
+            "strict": True,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "Repository-relative path, or . for the whole repository."
+                        ),
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_tests",
+            "description": (
+                "Run the repository's fixed unittest suite without accepting a shell "
+                "command. Output and runtime are bounded."
+            ),
+            "strict": True,
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
                 "additionalProperties": False,
             },
         },
@@ -375,14 +518,331 @@ def echo(arguments: dict[str, Any]) -> dict[str, str]:
     return {"text": validated["text"]}
 
 
+def _repository_root() -> Path:
+    """Return the repository boundary used by all filesystem tools."""
+    return Path.cwd().resolve()
+
+
+def _is_sensitive_path(path: Path) -> bool:
+    if any(part in EXCLUDED_DIRECTORY_NAMES for part in path.parts):
+        return True
+    return any(
+        part == ".env" or (part.startswith(".env.") and part != ".env.example")
+        for part in path.parts
+    )
+
+
+def _resolve_repository_path(raw_path: str) -> tuple[Path, str]:
+    path_text = raw_path.strip()
+    if not path_text:
+        raise ToolArgumentError("argument 'path' must not be empty")
+
+    supplied = Path(path_text)
+    if supplied.is_absolute():
+        raise ToolArgumentError("argument 'path' must be repository-relative")
+
+    root = _repository_root()
+    candidate = (root / supplied).resolve()
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError as exc:
+        raise ToolArgumentError("path must stay inside the repository") from exc
+    if _is_sensitive_path(relative):
+        raise ToolArgumentError("path is excluded from repository tools")
+    display_path = relative.as_posix() or "."
+    return candidate, display_path
+
+
+def _visible_files(path: Path) -> list[Path]:
+    """Return deterministic files without descending into generated directories."""
+    root = _repository_root()
+    if path.is_file():
+        return [path]
+
+    files: list[Path] = []
+    for directory, directory_names, file_names in os.walk(path, followlinks=False):
+        relative_directory = Path(directory).relative_to(root)
+        directory_names[:] = sorted(
+            name
+            for name in directory_names
+            if name not in EXCLUDED_DIRECTORY_NAMES
+            and not _is_sensitive_path(relative_directory / name)
+        )
+        for name in sorted(file_names):
+            candidate = Path(directory) / name
+            relative = candidate.relative_to(root)
+            if _is_sensitive_path(relative):
+                continue
+            try:
+                candidate.resolve().relative_to(root)
+            except (OSError, ValueError):
+                continue
+            if not candidate.is_file():
+                continue
+            files.append(candidate)
+    return sorted(files, key=lambda item: item.relative_to(root).as_posix())
+
+
+def _validate_positive_integer(name: str, value: Any, maximum: int | None = None) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ToolArgumentError(f"argument '{name}' must be a positive integer")
+    if maximum is not None and value > maximum:
+        raise ToolArgumentError(f"argument '{name}' must not exceed {maximum}")
+    return value
+
+
+def _truncate_output(
+    output: str,
+    *,
+    max_lines: int = MAX_PROCESS_OUTPUT_LINES,
+    max_chars: int = MAX_TOOL_OUTPUT_CHARS,
+    keep_tail: bool = False,
+) -> tuple[str, bool]:
+    """Bound process output by lines and characters while preserving useful context."""
+    lines = output.splitlines()
+    truncated = len(lines) > max_lines
+    if truncated:
+        lines = lines[-max_lines:] if keep_tail else lines[:max_lines]
+    bounded = "\n".join(lines)
+    if len(bounded) > max_chars:
+        truncated = True
+        bounded = bounded[-max_chars:] if keep_tail else bounded[:max_chars]
+    return bounded, truncated
+
+
+def list_files(arguments: dict[str, Any]) -> dict[str, Any]:
+    validated = _require_exact_arguments(arguments, required={"path": str})
+    path, display_path = _resolve_repository_path(validated["path"])
+    if not path.exists():
+        raise ToolArgumentError(f"path does not exist: {display_path}")
+    if not path.is_dir():
+        raise ToolArgumentError(f"path is not a directory: {display_path}")
+
+    root = _repository_root()
+    files = [item.relative_to(root).as_posix() for item in _visible_files(path)]
+    returned_files: list[str] = []
+    returned_characters = 0
+    for file_name in files[:MAX_LISTED_FILES]:
+        serialized_size = len(json.dumps(file_name, ensure_ascii=False)) + 1
+        if returned_characters + serialized_size > MAX_TOOL_OUTPUT_CHARS:
+            break
+        returned_files.append(file_name)
+        returned_characters += serialized_size
+    truncated = len(returned_files) < len(files)
+    return {
+        "path": display_path,
+        "files": returned_files,
+        "truncated": truncated,
+        "returned_count": len(returned_files),
+        "total_count": len(files),
+    }
+
+
+def read_file(arguments: dict[str, Any]) -> dict[str, Any]:
+    validated = _require_exact_arguments(
+        arguments,
+        required={"path": str, "start_line": int, "max_lines": int},
+    )
+    start_line = _validate_positive_integer("start_line", validated["start_line"])
+    max_lines = _validate_positive_integer(
+        "max_lines", validated["max_lines"], MAX_READ_LINES
+    )
+    path, display_path = _resolve_repository_path(validated["path"])
+    if not path.is_file():
+        raise ToolArgumentError(f"path is not a file: {display_path}")
+
+    selected: list[str] = []
+    has_more = False
+    try:
+        with path.open("r", encoding="utf-8") as stream:
+            for line_number, line in enumerate(stream, start=1):
+                if line_number < start_line:
+                    continue
+                if len(selected) == max_lines:
+                    has_more = True
+                    break
+                selected.append(line.rstrip("\n\r"))
+    except (OSError, UnicodeError) as exc:
+        raise ToolArgumentError(f"file is not readable UTF-8: {display_path}") from exc
+
+    content, character_truncated = _truncate_output(
+        "\n".join(selected), max_lines=max_lines
+    )
+    returned_lines = len(content.splitlines()) if content else 0
+    return {
+        "path": display_path,
+        "start_line": start_line,
+        "end_line": start_line + returned_lines - 1 if returned_lines else None,
+        "content": content,
+        "truncated": has_more or character_truncated,
+        "next_start_line": (
+            start_line + returned_lines if has_more and not character_truncated else None
+        ),
+    }
+
+
+def search_text(arguments: dict[str, Any]) -> dict[str, Any]:
+    validated = _require_exact_arguments(
+        arguments, required={"query": str, "path": str}
+    )
+    query = validated["query"]
+    if not query:
+        raise ToolArgumentError("argument 'query' must not be empty")
+    if len(query) > 200:
+        raise ToolArgumentError("argument 'query' must not exceed 200 characters")
+    path, display_path = _resolve_repository_path(validated["path"])
+    if not path.exists():
+        raise ToolArgumentError(f"path does not exist: {display_path}")
+
+    root = _repository_root()
+    matches: list[dict[str, Any]] = []
+    match_characters = 0
+    skipped_files = 0
+    truncated = False
+    for candidate in _visible_files(path):
+        try:
+            if candidate.stat().st_size > MAX_SEARCH_FILE_BYTES:
+                skipped_files += 1
+                continue
+            file_matches: list[dict[str, Any]] = []
+            with candidate.open("r", encoding="utf-8") as stream:
+                for line_number, line in enumerate(stream, start=1):
+                    if query not in line:
+                        continue
+                    text = line.rstrip("\n\r")
+                    match_index = text.find(query)
+                    excerpt_start = max(0, match_index - MAX_SEARCH_LINE_CHARS // 3)
+                    excerpt = text[
+                        excerpt_start : excerpt_start + MAX_SEARCH_LINE_CHARS
+                    ]
+                    file_matches.append(
+                        {
+                            "path": candidate.relative_to(root).as_posix(),
+                            "line": line_number,
+                            "column": match_index + 1,
+                            "text": excerpt,
+                            "line_truncated": len(text) > MAX_SEARCH_LINE_CHARS,
+                            "excerpt_start_column": excerpt_start + 1,
+                        }
+                    )
+                    if len(matches) + len(file_matches) > MAX_SEARCH_RESULTS:
+                        truncated = True
+                        break
+        except (OSError, UnicodeError):
+            skipped_files += 1
+            continue
+        for match in file_matches:
+            serialized_size = len(json.dumps(match, ensure_ascii=False)) + 1
+            if (
+                len(matches) == MAX_SEARCH_RESULTS
+                or match_characters + serialized_size > MAX_TOOL_OUTPUT_CHARS
+            ):
+                truncated = True
+                break
+            matches.append(match)
+            match_characters += serialized_size
+        if truncated:
+            break
+
+    return {
+        "query": query,
+        "path": display_path,
+        "matches": matches,
+        "truncated": truncated,
+        "returned_count": len(matches),
+        "skipped_files": skipped_files,
+    }
+
+
+def _run_bounded_process(
+    command: list[str],
+    *,
+    keep_tail: bool,
+    timeout_seconds: float = TEST_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=_repository_root(),
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        partial = exc.stdout or ""
+        if isinstance(partial, bytes):
+            partial = partial.decode("utf-8", errors="replace")
+        output, truncated = _truncate_output(partial, keep_tail=True)
+        return {
+            "exit_code": None,
+            "output": output,
+            "truncated": truncated,
+            "timed_out": True,
+        }
+
+    output, truncated = _truncate_output(completed.stdout, keep_tail=keep_tail)
+    return {
+        "exit_code": completed.returncode,
+        "output": output,
+        "truncated": truncated,
+        "timed_out": False,
+    }
+
+
+def git_diff(
+    arguments: dict[str, Any], timeout_seconds: float = TEST_TIMEOUT_SECONDS
+) -> dict[str, Any]:
+    validated = _require_exact_arguments(arguments, required={"path": str})
+    _, display_path = _resolve_repository_path(validated["path"])
+    result = _run_bounded_process(
+        ["git", "diff", "--no-ext-diff", "--no-color", "HEAD", "--", display_path],
+        keep_tail=False,
+        timeout_seconds=min(timeout_seconds, TEST_TIMEOUT_SECONDS),
+    )
+    result["path"] = display_path
+    return result
+
+
+def run_tests(
+    arguments: dict[str, Any], timeout_seconds: float = TEST_TIMEOUT_SECONDS
+) -> dict[str, Any]:
+    _require_exact_arguments(arguments, required={})
+    root = _repository_root()
+    python = root / ".venv" / "bin" / "python"
+    if not python.is_file():
+        raise ToolArgumentError("repository virtual environment is missing: .venv")
+    result = _run_bounded_process(
+        [str(python), "-m", "unittest", "discover", "-s", "tests", "-v"],
+        keep_tail=True,
+        timeout_seconds=min(timeout_seconds, TEST_TIMEOUT_SECONDS),
+    )
+    result["command"] = ".venv/bin/python -m unittest discover -s tests -v"
+    return result
+
+
 TOOL_HANDLERS = {
     "calculator": calculator,
     "get_current_time": get_current_time,
     "echo": echo,
+    "list_files": list_files,
+    "read_file": read_file,
+    "search_text": search_text,
+    "git_diff": git_diff,
+    "run_tests": run_tests,
 }
 
 
-def execute_tool(name: str, raw_arguments: str | None) -> dict[str, Any]:
+def execute_tool(
+    name: str,
+    raw_arguments: str | None,
+    *,
+    timeout_seconds: float | None = None,
+) -> dict[str, Any]:
     """Parse, validate, and execute one tool call as a serializable envelope."""
     try:
         if raw_arguments is None:
@@ -395,6 +855,11 @@ def execute_tool(name: str, raw_arguments: str | None) -> dict[str, Any]:
         handler = TOOL_HANDLERS.get(name)
         if handler is None:
             raise ToolArgumentError(f"unknown tool: {name}")
+        if name in {"git_diff", "run_tests"} and timeout_seconds is not None:
+            return {
+                "ok": True,
+                "result": handler(arguments, timeout_seconds=timeout_seconds),
+            }
         return {"ok": True, "result": handler(arguments)}
     except Exception as exc:
         return {
@@ -636,7 +1101,7 @@ def run_turn(
             )
 
             for call in serialized_calls:
-                _remaining_seconds(deadline)
+                tool_timeout = _remaining_seconds(deadline)
                 call_id = call["id"]
                 name = call["function"]["name"]
                 raw_arguments = call["function"]["arguments"]
@@ -648,7 +1113,11 @@ def run_turn(
                     raw_arguments=raw_arguments,
                 )
                 tool_started_at = time.monotonic()
-                result = execute_tool(name, raw_arguments)
+                result = execute_tool(
+                    name,
+                    raw_arguments,
+                    timeout_seconds=tool_timeout,
+                )
                 elapsed_ms = round(
                     (time.monotonic() - tool_started_at) * 1_000, 2
                 )
@@ -726,7 +1195,7 @@ def interactive_cli(
         )
         return 2
 
-    print("Harness Stage 2. Type /help for help or /exit to quit.")
+    print("Harness Stage 3. Type /help for help or /exit to quit.")
     while True:
         try:
             prompt = input("\nyou> ").strip()

@@ -1,8 +1,9 @@
-# Harness — Stage 2: First Agent Loop
+# Harness — Stage 3: Read-only Mini Coding Agent
 
 Conversational terminal client for `gpt-oss-120b` through the Cerebras API. The
-model can respond directly or request tools; the program executes each call,
-returns its result, and repeats until it receives a final response.
+model can inspect the repository in the current working directory, run its fixed
+test suite, or request the Stage 2 utility tools. It cannot edit files or execute
+model-supplied shell commands.
 
 The loop is deliberately straightforward and does not use an agent framework:
 
@@ -12,17 +13,37 @@ The loop is deliberately straightforward and does not use an agent framework:
 4. add each result with its corresponding `tool_call_id`;
 5. return to step 2 until a final response is received.
 
-## Tools
+## Read-only coding tools
 
-The three tools do not access the network or modify files:
+Every filesystem path must be relative to the repository and remains confined to
+that directory after symlinks are resolved. Generated directories such as
+`.git`, `.venv`, and `__pycache__` are excluded, as are local `.env` files.
+
+- `list_files`: recursively returns sorted paths below a directory, capped at
+  500 files.
+- `read_file`: reads a one-based range of up to 200 UTF-8 lines and caps content
+  at 16,000 characters. Its result indicates whether more content exists.
+- `search_text`: searches for a literal, case-sensitive fragment and returns up
+  to 50 locations with bounded line excerpts. Binary files and files larger
+  than 1 MB are skipped.
+- `git_diff`: returns the staged and unstaged tracked-file diff against `HEAD`
+  for a selected path. External diff programs are disabled.
+- `run_tests`: invokes only
+  `.venv/bin/python -m unittest discover -s tests -v`, with a 60-second timeout.
+
+`git_diff` and `run_tests` return at most 400 lines and 16,000 characters.
+Truncated results carry `truncated: true`, allowing the model to narrow the next
+request instead of filling its context with an unbounded result.
+
+The Stage 2 utility tools remain available and do not access the network or
+modify files:
 
 - `calculator`: evaluates numeric expressions containing `+`, `-`, `*`, `/`,
   `//`, `%`, and `**`. It uses a restricted interpreter based on Python's AST,
   not `eval`.
 - `get_current_time`: returns the current time in an IANA time zone, such as
   `UTC` or `America/Argentina/Mendoza`.
-- `echo`: returns text unchanged. It is included as a harmless third tool
-  because the assignment requests three tools while listing only the two above.
+- `echo`: returns text unchanged.
 
 Each tool declares a strict JSON schema. Before execution, the harness verifies
 that the arguments are valid JSON, all required fields are present, their types
@@ -45,7 +66,8 @@ The JSON Lines log includes session start and end events, user messages,
 iteration starts, API requests and responses, agent decisions, tool starts and
 results, `call_id` values, arguments, errors, latency, metrics, and termination
 reasons. Prompts, responses, and arguments are stored in full, so the file may
-contain sensitive information.
+contain sensitive information. Tool results stored in the log have the same
+bounds as the results sent to the model.
 
 ## Installation
 
@@ -75,7 +97,7 @@ does not send a request to the model. `/help` displays all available commands.
 Single prompt:
 
 ```bash
-.venv/bin/python harness.py "What is (27 + 5) * 3?"
+.venv/bin/python harness.py "Find the tests for tool argument validation."
 ```
 
 Configure limits and logging:
@@ -85,7 +107,7 @@ Configure limits and logging:
   --max-turns 5 \
   --timeout 20 \
   --log-file logs/session.jsonl \
-  "What time is it in America/Argentina/Mendoza?"
+  "Summarize the current diff and run the tests."
 ```
 
 The utilization shown at the end sums the tokens from every call in the loop
