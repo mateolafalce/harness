@@ -1,18 +1,71 @@
-# Harness — Stage 4: Editing and Security
+# Harness — Stage 5: Context Engineering
 
 Conversational terminal client for `gpt-oss-120b` through the Cerebras API. The
-agent can inspect and edit the current repository, but persistent edits and code
-execution are separated behind explicit tools, approval policy, path checks,
-bounded execution, and a disposable working copy.
+agent can inspect and edit the current repository while curating its limited
+context window. Persistent edits and code execution remain separated behind
+explicit tools, approval policy, path checks, bounded execution, and a disposable
+working copy.
 
 The loop remains deliberately small and does not use an agent framework:
 
-1. add the user's message to the conversation history;
-2. call the model with strict tool schemas and `tool_choice="auto"`;
-3. validate each requested tool and its arguments;
-4. request approval when the tool edits files or executes project code;
-5. return each bounded result with its corresponding `tool_call_id`;
-6. continue until the model produces a final response or a loop limit is hit.
+1. load global and repository instructions;
+2. rank likely relevant file paths for the current request;
+3. add the user's message to durable conversation history;
+4. call the model with strict tool schemas and `tool_choice="auto"`;
+5. validate each requested tool and request approval for side effects;
+6. summarize oversized results before adding them to model context;
+7. compact complete older turns when the configured threshold is reached;
+8. persist the session and progress notes after safe checkpoints;
+9. continue until the model produces a final response or a loop limit is hit.
+
+## Context engineering
+
+The system prompt is assembled from the CLI `--system-prompt`, an optional global
+instruction file, and repository `AGENTS.md` files. The default global location is
+`$HARNESS_HOME/AGENTS.md`, or `~/.harness/AGENTS.md` when `HARNESS_HOME` is unset.
+The root `AGENTS.md` is loaded at startup. When relevant files are selected,
+nested `AGENTS.md` files from their parent directories are added just in time;
+deeper documents take precedence inside their scope. Each instruction file is
+bounded to 24,000 characters and the combined instruction context to 64,000.
+
+Relevant-file selection ranks paths from task words, exact filenames, and test
+signals. It sends at most eight path hints by default, without eagerly reading
+file bodies. The existing `list_files`, `search_text`, and `read_file` tools then
+provide progressive disclosure. Set the cap with `--relevant-files`.
+
+Tool results remain complete in the JSONL event log, but payloads over 4,000
+characters are represented in model history by a valid JSON head/tail summary.
+This prevents a long test run or diff from dominating subsequent attention while
+letting the model request a narrower query when exact middle content matters.
+
+Before each model call, history size is estimated conservatively. Above
+`--compaction-threshold` (0.70 by default), complete older user turns are replaced
+with a bounded working summary; the newest two turns remain verbatim by default.
+Use `--keep-recent-turns` to tune retention or `/compact` to request compaction in
+interactive mode. Architectural decisions, user requests, tool names, failures,
+and answer excerpts are retained, while raw old tool payloads are discarded.
+
+## Sessions and progress
+
+Conversation state is atomically persisted to `.harness/session.json` with mode
+`0600`. The state contains a schema version, repository identity, session ID, and
+model messages. It is rejected if malformed or opened from another repository.
+Resume it with:
+
+```bash
+.venv/bin/python harness.py --resume
+```
+
+Use `--session-file PATH` for another repository-relative state file. On resume,
+the current `AGENTS.md` instructions replace the stored system prompt so policy
+changes take effect, while compacted history and recent turns remain available.
+Session files and JSONL logs are excluded from model-facing repository tools.
+
+`.harness/progress.md` is a compact, human-readable checkpoint for long work. It
+records the durable objective, recent tool outcomes, completion, or interruption
+after each safe step. On resume it is injected as explicitly fallible working
+memory: the model is told to verify it against current source. Configure its path
+with `--progress-file`.
 
 ## Editing and approvals
 
@@ -72,7 +125,7 @@ untrusted repository.
 
 ## Repository tools and limits
 
-The Stage 3 inspection tools remain available:
+The inspection tools remain available:
 
 - `list_files`: sorted recursive paths, capped at 500 files;
 - `read_file`: up to 200 UTF-8 lines and 16,000 characters;
@@ -86,7 +139,7 @@ from filesystem tools, as are local `.env` files. Process output is capped at
 patch subprocesses have a 10-second maximum. Both also receive no more than the
 time remaining in the complete agent loop.
 
-The Stage 2 utilities remain available: `calculator`, `get_current_time`, and
+The utility tools remain available: `calculator`, `get_current_time`, and
 `echo`. Every tool declares a strict JSON schema and rejects missing, mistyped,
 or additional arguments. Tool failures are structured results, allowing the
 model to recover without corrupting conversation history.
@@ -97,7 +150,8 @@ messages are removed from conversation history.
 
 ## Observability
 
-The JSONL log includes session configuration, messages, API calls, tool calls,
+The JSONL log includes session configuration, selected paths, compactions, API
+calls, tool calls,
 approval requests and outcomes, errors, latency, token metrics, and termination
 reasons. Prompts, responses, and tool arguments are stored in full, so logs can
 contain sensitive data and must not be committed.
@@ -141,13 +195,14 @@ Trusted editing session with explicit limits:
 ```
 
 During interactive mode, `/clear` resets conversation turns while preserving the
-system instruction. `/help` lists interactive commands.
+system instruction. `/compact` summarizes eligible older turns. `/help` lists
+interactive commands.
 
-This stage follows the separation between sandbox capabilities and approval
-policy described by the [official Codex documentation](https://learn.chatgpt.com/docs/agent-approvals-security.md),
-and the `allow` / `ask` / `deny` tool policy model documented by
-[OpenCode tools](https://opencode.ai/docs/tools/) and
-[OpenCode agents](https://opencode.ai/docs/agents/).
+The context design follows Anthropic's
+[Effective context engineering for AI agents](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents):
+keep the smallest high-signal context, retrieve details just in time, compact old
+history, and persist structured notes outside the context window. The security
+model continues to separate sandbox capabilities from explicit approval policy.
 
 ## Tests
 
