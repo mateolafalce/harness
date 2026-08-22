@@ -1,100 +1,86 @@
-# Harness — Stage 5: Context Engineering
+# Harness
 
-Conversational terminal client for `gpt-oss-120b` through the Cerebras API. The
-agent can inspect and edit the current repository while curating its limited
-context window. Persistent edits and code execution remain separated behind
-explicit tools, approval policy, path checks, bounded execution, and a disposable
-working copy.
+Small Cerebras coding agent for `gpt-oss-120b`. Inspects and edits current
+repository. Manages limited model context. No agent framework.
 
-The loop remains deliberately small and does not use an agent framework:
+Core loop:
 
-1. load global and repository instructions;
-2. rank likely relevant file paths for the current request;
-3. add the user's message to durable conversation history;
-4. call the model with strict tool schemas and `tool_choice="auto"`;
-5. validate each requested tool and request approval for side effects;
-6. summarize oversized results before adding them to model context;
-7. compact complete older turns when the configured threshold is reached;
-8. persist the session and progress notes after safe checkpoints;
-9. continue until the model produces a final response or a loop limit is hit.
+1. Load global and repository instructions.
+2. Rank likely relevant files.
+3. Add user message to durable history.
+4. Call model with strict tools and `tool_choice="auto"`.
+5. Validate tools; request approval for side effects.
+6. Summarize large outputs.
+7. Compact old complete turns near context limit.
+8. Save session and progress checkpoints.
+9. Continue until final response or guardrail stop.
 
-## Context engineering
+## Context
 
-The system prompt is assembled from the CLI `--system-prompt`, an optional global
-instruction file, and repository `AGENTS.md` files. The default global location is
-`$HARNESS_HOME/AGENTS.md`, or `~/.harness/AGENTS.md` when `HARNESS_HOME` is unset.
-The root `AGENTS.md` is loaded at startup. When relevant files are selected,
-nested `AGENTS.md` files from their parent directories are added just in time;
-deeper documents take precedence inside their scope. Each instruction file is
-bounded to 24,000 characters and the combined instruction context to 64,000.
+Instruction order:
 
-Relevant-file selection ranks paths from task words, exact filenames, and test
-signals. It sends at most eight path hints by default, without eagerly reading
-file bodies. The existing `list_files`, `search_text`, and `read_file` tools then
-provide progressive disclosure. Set the cap with `--relevant-files`.
+1. `--system-prompt`
+2. `$HARNESS_HOME/AGENTS.md`, or `~/.harness/AGENTS.md`
+3. Root `AGENTS.md`
+4. Nested `AGENTS.md` files governing selected paths
 
-Tool results remain complete in the JSONL event log, but payloads over 4,000
-characters are represented in model history by a valid JSON head/tail summary.
-This prevents a long test run or diff from dominating subsequent attention while
-letting the model request a narrower query when exact middle content matters.
+Deeper repository instructions win inside their scope. Limit: 24,000 characters
+per file, 64,000 combined. `read_file` reports applicable instruction paths.
 
-Before each model call, history size is estimated conservatively. Above
-`--compaction-threshold` (0.70 by default), complete older user turns are replaced
-with a bounded working summary; the newest two turns remain verbatim by default.
-Use `--keep-recent-turns` to tune retention or `/compact` to request compaction in
-interactive mode. Architectural decisions, user requests, tool names, failures,
-and answer excerpts are retained, while raw old tool payloads are discarded.
+Relevant-file selection scores task words, exact filenames, and test signals.
+Default: eight path hints, no eager file-body loading. Tune with
+`--relevant-files`. Model retrieves exact context through `list_files`,
+`search_text`, and `read_file`.
+
+Tool payloads over 4,000 characters become valid JSON head/tail summaries in
+model history. Full results remain in JSONL logs. Model can rerun narrower query
+when omitted middle matters.
+
+History compacts above `--compaction-threshold` (`0.70` default). Complete old
+turns become bounded working summary. Latest two turns stay verbatim; tune with
+`--keep-recent-turns`. Interactive `/compact` triggers manual compaction.
 
 ## Sessions and progress
 
-Conversation state is atomically persisted to `.harness/session.json` with mode
-`0600`. The state contains a schema version, repository identity, session ID, and
-model messages. It is rejected if malformed or opened from another repository.
-Resume it with:
+Session state saves atomically to `.harness/session.json`, mode `0600`. Contains
+schema version, repository identity, session ID, and model messages.
+
+Resume:
 
 ```bash
 .venv/bin/python harness.py --resume
 ```
 
-Use `--session-file PATH` for another repository-relative state file. On resume,
-the current `AGENTS.md` instructions replace the stored system prompt so policy
-changes take effect, while compacted history and recent turns remain available.
-Session files and JSONL logs are excluded from model-facing repository tools.
+Use `--session-file PATH` for another repository-relative file. Resume reloads
+current `AGENTS.md`; stored system instructions never override new policy.
+Malformed state, cross-repository state, and unrelated existing files are
+rejected. Session files and JSONL logs stay hidden from model-facing repository
+tools.
 
-`.harness/progress.md` is a compact, human-readable checkpoint for long work. It
-records the durable objective, recent tool outcomes, completion, or interruption
-after each safe step. On resume it is injected as explicitly fallible working
-memory: the model is told to verify it against current source. Configure its path
-with `--progress-file`.
+Long tasks write `.harness/progress.md`: objective, status, recent tool outcomes,
+completion, interruption. Resume injects notes as fallible memory; model must
+verify against source. Configure with `--progress-file`.
 
 ## Editing and approvals
 
-`apply_patch` is the only model-facing tool that persists source changes. It
-accepts either the `*** Begin Patch` marker format or a standard unified Git
-diff, with a maximum input size of 100,000 characters. It supports adding,
-updating, and deleting up to 50 UTF-8 text files per call. All paths must be
-repository-relative;
-absolute paths, traversal, excluded paths, and symlink aliases are rejected.
-Marker patches validate every file and hunk before writing, so an invalid later
-hunk does not leave earlier changes behind.
+`apply_patch` provides only persistent model-facing edit path. Accepts
+`*** Begin Patch` format or unified Git diff. Limits: 100,000 characters, 50
+UTF-8 files. Rejects absolute paths, traversal, excluded paths, and symlink
+aliases. Validates all files and hunks before writing; failed patch leaves no
+partial edits.
 
-`run_tests` and `run_shell` execute project code or processes. These tools and
-`apply_patch` use `--approval-policy`:
+`apply_patch`, `run_tests`, and `run_shell` use `--approval-policy`:
 
-- `ask` (default): request confirmation in the local terminal and deny when no
-  interactive TTY is available;
-- `allow`: execute valid gated calls without prompting;
-- `deny`: reject every gated call.
+- `ask`: prompt local terminal; deny without interactive TTY.
+- `allow`: execute valid gated calls without prompt. Trusted workflows only.
+- `deny`: reject all gated calls.
 
-Approval decisions are returned to the model and recorded as structured JSONL
-events. Argument and path validation happens before a prompt is shown. The
-`allow` mode is intended only for an already trusted workflow.
+Validation runs before approval. Decision returns to model and JSONL log.
 
-## Limited shell and sandbox
+## Shell sandbox
 
-`run_shell` parses one command with `shlex` and passes an argument vector directly
-to `subprocess.run`; it never invokes `sh`, `bash`, or `shell=True`. Only these
-forms are accepted, with a maximum command length of 1,000 characters:
+`run_shell` uses `shlex` plus direct `subprocess.run`; never `shell=True`. Command
+limit: 1,000 characters. Allowed forms only:
 
 ```text
 git status --short
@@ -105,58 +91,43 @@ rg QUERY PATH
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-Extra arguments, control operators, arbitrary Python, absolute paths, and paths
-outside the project are rejected. Git hooks, filesystem monitors, external diff
-programs, and text conversion are disabled for the allowed Git commands.
+Rejects extra arguments, control operators, arbitrary Python, absolute paths,
+and outside-project paths. Disables Git hooks, filesystem monitors, external
+diff programs, and text conversion.
 
-Every allowed command runs with the disposable sandbox: the repository is copied
-to a temporary directory, generated caches, `.venv`, local `.env` files, and the
-default event log are omitted, and the temporary tree is removed after the
-process exits. `run_tests` uses the same path and invokes the project's original
-virtual-environment interpreter with the disposable copy as its working
-directory. The child environment keeps only basic locale, terminal, temporary
-directory, and executable-path settings; API keys and proxy variables are not
-forwarded. Shell filesystem changes therefore do not persist in the project.
+Commands run in disposable repository copy. Copy omits generated caches,
+`.venv`, local `.env` files, and default event log. Child environment keeps only
+basic locale, terminal, temporary-directory, and executable-path values. API
+keys and proxy variables stay out. Shell filesystem changes never persist.
 
-The disposable copy limits damage to repository state; it is not an OS security
-boundary and does not block host reads or network access from already approved
-project code. Run this harness itself in a container or VM when processing an
-untrusted repository.
+Disposable copy limits repository damage. It is not OS isolation: approved code
+can still read host data or use network. Use container or VM for untrusted
+repositories.
 
-## Repository tools and limits
+## Tools and limits
 
-The inspection tools remain available:
+- `list_files`: sorted recursive paths; 500-file cap.
+- `read_file`: 200 UTF-8 lines; 16,000-character cap.
+- `search_text`: 50 literal matches; skips binary and files over 1 MB.
+- `git_diff`: bounded tracked-file diff; external diff disabled.
+- `run_tests`: fixed unittest command; approval-gated and sandboxed.
+- `calculator`, `get_current_time`, `echo`: strict utility tools.
 
-- `list_files`: sorted recursive paths, capped at 500 files;
-- `read_file`: up to 200 UTF-8 lines and 16,000 characters;
-- `search_text`: up to 50 literal matches; skips binary files and files over 1 MB;
-- `git_diff`: bounded tracked-file diff with external diff programs disabled;
-- `run_tests`: the fixed unittest command, now approval-gated and sandboxed.
+All schemas reject missing, mistyped, or extra arguments. Tool errors return
+structured results so model can recover.
 
-Generated directories such as `.git`, `.venv`, and `__pycache__` are excluded
-from filesystem tools, as are local `.env` files. Process output is capped at
-400 lines and 16,000 characters. Generic shell execution has a 20-second maximum;
-patch subprocesses have a 10-second maximum. Both also receive no more than the
-time remaining in the complete agent loop.
-
-The utility tools remain available: `calculator`, `get_current_time`, and
-`echo`. Every tool declares a strict JSON schema and rejects missing, mistyped,
-or additional arguments. Tool failures are structured results, allowing the
-model to recover without corrupting conversation history.
-
-Each user message additionally has `--max-turns` (8 by default) and `--timeout`
-(30 seconds by default). If the loop fails or exceeds a limit, its incomplete
-messages are removed from conversation history.
+Excluded: `.git`, `.venv`, `__pycache__`, caches, local `.env` files. Process
+output cap: 400 lines and 16,000 characters. Shell timeout: 20 seconds. Patch
+timeout: 10 seconds. User-turn defaults: 8 model calls, 30 seconds. Failed or
+expired loops roll incomplete messages back.
 
 ## Observability
 
-The JSONL log includes session configuration, selected paths, compactions, API
-calls, tool calls,
-approval requests and outcomes, errors, latency, token metrics, and termination
-reasons. Prompts, responses, and tool arguments are stored in full, so logs can
-contain sensitive data and must not be committed.
+JSONL events cover session config, selected paths, compactions, API calls, tool
+calls, approvals, errors, latency, tokens, and termination. Logs store prompts,
+responses, and tool arguments in full. Sensitive. Never commit them.
 
-## Installation
+## Install
 
 ```bash
 python3 -m venv .venv
@@ -165,25 +136,25 @@ cp .env.example .env
 # Edit .env and add CEREBRAS_API_KEY.
 ```
 
-Create an API key in the [Cerebras console](https://cloud.cerebras.ai/). An
-already exported `CEREBRAS_API_KEY` takes precedence over `.env`.
+Create key in [Cerebras console](https://cloud.cerebras.ai/). Exported
+`CEREBRAS_API_KEY` wins over `.env`.
 
-## Usage
+## Use
 
-Interactive mode, with approval prompts enabled:
+Interactive:
 
 ```bash
 .venv/bin/python harness.py
 ```
 
-Single read-only request with all gated actions denied:
+Read-only:
 
 ```bash
 .venv/bin/python harness.py --approval-policy deny \
   "Review the current implementation without changing it."
 ```
 
-Trusted editing session with explicit limits:
+Trusted edit session:
 
 ```bash
 .venv/bin/python harness.py \
@@ -194,24 +165,20 @@ Trusted editing session with explicit limits:
   "Fix the failing test and verify it."
 ```
 
-During interactive mode, `/clear` resets conversation turns while preserving the
-system instruction. `/compact` summarizes eligible older turns. `/help` lists
-interactive commands.
+Interactive commands: `/clear`, `/compact`, `/help`, `/exit`, `/quit`.
 
-The context design follows Anthropic's
-[Effective context engineering for AI agents](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents):
-keep the smallest high-signal context, retrieve details just in time, compact old
-history, and persist structured notes outside the context window. The security
-model continues to separate sandbox capabilities from explicit approval policy.
+All options:
 
-## Tests
+```bash
+.venv/bin/python harness.py --help
+```
+
+## Test
 
 ```bash
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-To inspect all CLI options:
-
-```bash
-.venv/bin/python harness.py --help
-```
+Design follows Anthropic's
+[Effective context engineering for AI agents](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents):
+small high-signal context, just-in-time retrieval, compaction, durable notes.
