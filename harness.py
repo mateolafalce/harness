@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage 3: a small, read-only coding agent backed by Cerebras."""
+"""Stage 4: a small, approval-gated coding agent backed by Cerebras."""
 
 from __future__ import annotations
 
@@ -8,13 +8,17 @@ import ast
 import json
 import math
 import os
+import re
+import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from cerebras.cloud.sdk import Cerebras
@@ -34,6 +38,22 @@ MAX_SEARCH_LINE_CHARS = 240
 MAX_SEARCH_FILE_BYTES = 1_000_000
 MAX_PROCESS_OUTPUT_LINES = 400
 TEST_TIMEOUT_SECONDS = 60.0
+SHELL_TIMEOUT_SECONDS = 20.0
+PATCH_TIMEOUT_SECONDS = 10.0
+MAX_PATCH_CHARS = 100_000
+MAX_PATCH_FILES = 50
+MAX_PATCH_PATH_CHARS = 240
+MAX_SHELL_COMMAND_CHARS = 1_000
+APPROVAL_POLICIES = ("ask", "allow", "deny")
+SANDBOX_MODES = ("disposable",)
+ALLOWED_SHELL_COMMANDS = (
+    "git status --short",
+    "git diff --check",
+    "git diff --cached --check",
+    "git diff [-- PATH]",
+    "rg QUERY PATH",
+    ".venv/bin/python -m unittest discover -s tests -v",
+)
 EXCLUDED_DIRECTORY_NAMES = {
     ".git",
     ".mypy_cache",
@@ -43,10 +63,12 @@ EXCLUDED_DIRECTORY_NAMES = {
     "__pycache__",
 }
 DEFAULT_SYSTEM_PROMPT = (
-    "You are a read-only coding agent. Inspect the repository with the available "
-    "tools, select only the context needed to answer, and do not claim to have "
-    "modified files. Tool results may be truncated; request a narrower path or "
-    "range when needed."
+    "You are a coding agent working only inside the current repository. Inspect "
+    "before editing, use apply_patch for changes, and use run_shell only for an "
+    "allowlisted command. Editing and shell execution are approval-gated. Shell "
+    "commands run in a disposable repository copy, so their filesystem changes "
+    "do not persist. Tool results may be truncated; request narrower output when "
+    "needed."
 )
 
 
@@ -225,14 +247,63 @@ TOOLS = [
         "function": {
             "name": "run_tests",
             "description": (
-                "Run the repository's fixed unittest suite without accepting a shell "
-                "command. Output and runtime are bounded."
+                "Run the repository's fixed unittest suite in a disposable copy. "
+                "The call requires approval; output and runtime are bounded."
             ),
             "strict": True,
             "parameters": {
                 "type": "object",
                 "properties": {},
                 "required": [],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "apply_patch",
+            "description": (
+                "Apply an approved text patch inside the repository. Accepts the "
+                "*** Begin Patch format or a standard unified Git diff."
+            ),
+            "strict": True,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "patch": {
+                        "type": "string",
+                        "description": (
+                            "Patch text, limited to 100,000 characters and 50 files."
+                        ),
+                    }
+                },
+                "required": ["patch"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_shell",
+            "description": (
+                "Run one allowlisted command in a disposable repository copy. "
+                "No shell interpreter is used; output and runtime are bounded. "
+                f"Allowed forms: {'; '.join(ALLOWED_SHELL_COMMANDS)}."
+            ),
+            "strict": True,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": (
+                            "A single allowlisted command, up to 1,000 characters."
+                        ),
+                    }
+                },
+                "required": ["command"],
                 "additionalProperties": False,
             },
         },
@@ -258,6 +329,10 @@ class ToolProtocolError(AgentLoopError):
 
 class ToolArgumentError(ValueError):
     """Raised when tool arguments do not satisfy the declared input schema."""
+
+
+class ApprovalDeniedError(AgentLoopError):
+    """Raised when a side-effecting tool call is not approved."""
 
 
 def positive_int(value: str) -> int:
@@ -341,6 +416,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=Path("events.jsonl"),
         help="JSON Lines event log (default: events.jsonl).",
+    )
+    parser.add_argument(
+        "--approval-policy",
+        choices=APPROVAL_POLICIES,
+        default="ask",
+        help=(
+            "Policy for apply_patch, run_shell, and run_tests: ask, allow, or deny "
+            "(default: ask)."
+        ),
+    )
+    parser.add_argument(
+        "--sandbox",
+        choices=SANDBOX_MODES,
+        default="disposable",
+        help="Shell sandbox strategy (default: disposable repository copy).",
     )
     parser.add_argument(
         "--system-prompt",
@@ -759,12 +849,14 @@ def _run_bounded_process(
     *,
     keep_tail: bool,
     timeout_seconds: float = TEST_TIMEOUT_SECONDS,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     try:
         completed = subprocess.run(
             command,
-            cwd=_repository_root(),
-            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            cwd=cwd or _repository_root(),
+            env=env or {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -812,16 +904,451 @@ def run_tests(
     arguments: dict[str, Any], timeout_seconds: float = TEST_TIMEOUT_SECONDS
 ) -> dict[str, Any]:
     _require_exact_arguments(arguments, required={})
-    root = _repository_root()
-    python = root / ".venv" / "bin" / "python"
-    if not python.is_file():
-        raise ToolArgumentError("repository virtual environment is missing: .venv")
-    result = _run_bounded_process(
-        [str(python), "-m", "unittest", "discover", "-s", "tests", "-v"],
-        keep_tail=True,
+    return run_shell(
+        {"command": ".venv/bin/python -m unittest discover -s tests -v"},
         timeout_seconds=min(timeout_seconds, TEST_TIMEOUT_SECONDS),
     )
-    result["command"] = ".venv/bin/python -m unittest discover -s tests -v"
+
+
+def _resolve_patch_path(raw_path: str) -> tuple[Path, str]:
+    """Resolve a patch path without permitting symlink-based aliases."""
+    if len(raw_path) > MAX_PATCH_PATH_CHARS:
+        raise ToolArgumentError(
+            f"patch paths must not exceed {MAX_PATCH_PATH_CHARS} characters"
+        )
+    if ".." in Path(raw_path).parts:
+        raise ToolArgumentError("patch paths must not contain '..'")
+    path, display_path = _resolve_repository_path(raw_path)
+    lexical_path = Path(os.path.abspath(_repository_root() / raw_path))
+    if lexical_path != path:
+        raise ToolArgumentError("patch paths must not contain symlinks")
+    return path, display_path
+
+
+def _validated_patch_text(arguments: dict[str, Any]) -> str:
+    validated = _require_exact_arguments(arguments, required={"patch": str})
+    patch_text = validated["patch"]
+    if not patch_text.strip():
+        raise ToolArgumentError("argument 'patch' must not be empty")
+    if len(patch_text) > MAX_PATCH_CHARS:
+        raise ToolArgumentError(
+            f"argument 'patch' must not exceed {MAX_PATCH_CHARS} characters"
+        )
+    return patch_text
+
+
+def _parse_apply_patch(patch_text: str) -> list[dict[str, Any]]:
+    lines = patch_text.splitlines()
+    if not lines or lines[0] != "*** Begin Patch" or lines[-1] != "*** End Patch":
+        raise ToolArgumentError("invalid *** Begin Patch envelope")
+
+    sections: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    header_pattern = re.compile(r"^\*\*\* (Add|Update|Delete) File: (.+)$")
+    for line in lines[1:-1]:
+        match = header_pattern.match(line)
+        if match:
+            if current is not None:
+                sections.append(current)
+            operation, raw_path = match.groups()
+            _, display_path = _resolve_patch_path(raw_path)
+            current = {
+                "operation": operation.lower(),
+                "path": display_path,
+                "body": [],
+            }
+            continue
+        if line.startswith("*** Move to:"):
+            raise ToolArgumentError("moving files is not supported")
+        if current is None:
+            raise ToolArgumentError("patch content must follow a file header")
+        current["body"].append(line)
+    if current is not None:
+        sections.append(current)
+    if not sections:
+        raise ToolArgumentError("patch does not contain any file sections")
+    if len(sections) > MAX_PATCH_FILES:
+        raise ToolArgumentError(
+            f"a patch must not change more than {MAX_PATCH_FILES} files"
+        )
+
+    paths = [section["path"] for section in sections]
+    if len(paths) != len(set(paths)):
+        raise ToolArgumentError("a patch may change each path only once")
+    return sections
+
+
+def _apply_update_hunks(original: str, body: list[str], path: str) -> str:
+    source_lines = original.splitlines()
+    trailing_newline = original.endswith("\n")
+    result = source_lines[:]
+    offset = 0
+    index = 0
+    if not body or not body[0].startswith("@@"):
+        raise ToolArgumentError(f"update section requires a hunk header: {path}")
+
+    while index < len(body):
+        if not body[index].startswith("@@"):
+            raise ToolArgumentError(f"invalid hunk header for {path}")
+        index += 1
+        hunk: list[str] = []
+        while index < len(body) and not body[index].startswith("@@"):
+            line = body[index]
+            if line == "\\ No newline at end of file":
+                index += 1
+                continue
+            if not line or line[0] not in " +-":
+                raise ToolArgumentError(f"invalid hunk line for {path}")
+            hunk.append(line)
+            index += 1
+
+        old_lines = [line[1:] for line in hunk if line[0] in " -"]
+        new_lines = [line[1:] for line in hunk if line[0] in " +"]
+        start = None
+        for candidate in range(max(offset, 0), len(result) - len(old_lines) + 1):
+            if result[candidate : candidate + len(old_lines)] == old_lines:
+                start = candidate
+                break
+        if start is None:
+            raise ToolArgumentError(f"patch hunk does not match file: {path}")
+        result[start : start + len(old_lines)] = new_lines
+        offset = start + len(new_lines)
+
+    rendered = "\n".join(result)
+    if trailing_newline and result:
+        rendered += "\n"
+    return rendered
+
+
+def _prepare_apply_patch_changes(
+    sections: list[dict[str, Any]],
+) -> dict[Path, bytes | None]:
+    changes: dict[Path, bytes | None] = {}
+    for section in sections:
+        path, display_path = _resolve_patch_path(section["path"])
+        operation = section["operation"]
+        body = section["body"]
+        if operation == "add":
+            if path.exists():
+                raise ToolArgumentError(f"cannot add an existing path: {display_path}")
+            if any(not line.startswith("+") for line in body):
+                raise ToolArgumentError(
+                    f"added file lines must start with '+': {display_path}"
+                )
+            content = "\n".join(line[1:] for line in body)
+            if body:
+                content += "\n"
+        else:
+            if not path.is_file():
+                raise ToolArgumentError(f"path is not a file: {display_path}")
+            try:
+                original = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeError) as exc:
+                raise ToolArgumentError(
+                    f"file is not writable UTF-8: {display_path}"
+                ) from exc
+            if operation == "update":
+                content = _apply_update_hunks(original, body, display_path)
+            else:
+                expected = [line[1:] for line in body if line.startswith("-")]
+                invalid = [line for line in body if not line.startswith("-")]
+                if invalid:
+                    raise ToolArgumentError(
+                        f"deleted file lines must start with '-': {display_path}"
+                    )
+                if expected and original.splitlines() != expected:
+                    raise ToolArgumentError(
+                        f"delete section does not match file: {display_path}"
+                    )
+                content = None
+        changes[path] = None if content is None else content.encode("utf-8")
+    return changes
+
+
+def _write_patch_changes(changes: dict[Path, bytes | None]) -> None:
+    originals: dict[Path, tuple[bytes | None, int | None]] = {}
+    for path in changes:
+        originals[path] = (
+            path.read_bytes() if path.exists() else None,
+            path.stat().st_mode if path.exists() else None,
+        )
+    try:
+        for path, content in changes.items():
+            if content is None:
+                path.unlink()
+                continue
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as stream:
+                temporary_path = Path(stream.name)
+                stream.write(content)
+            mode = originals[path][1]
+            if mode is not None:
+                os.chmod(temporary_path, mode)
+            os.replace(temporary_path, path)
+    except Exception:
+        for path, (content, mode) in originals.items():
+            if content is None:
+                if path.exists():
+                    path.unlink()
+                continue
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+            if mode is not None:
+                os.chmod(path, mode)
+        raise
+
+
+def _unified_patch_paths(patch_text: str) -> list[str]:
+    forbidden = ("GIT binary patch", "Binary files ", "rename from ", "copy from ")
+    lines = patch_text.splitlines()
+    if any(line.startswith(forbidden) for line in lines):
+        raise ToolArgumentError("binary, rename, and copy patches are not supported")
+    if any(
+        line.endswith(" mode 120000") or line.startswith("Subproject commit ")
+        for line in lines
+    ):
+        raise ToolArgumentError("symlink and submodule patches are not supported")
+
+    paths: list[str] = []
+    for line in lines:
+        if line.startswith("diff --git "):
+            try:
+                fields = shlex.split(line)
+            except ValueError as exc:
+                raise ToolArgumentError("invalid unified diff header") from exc
+            if len(fields) != 4:
+                raise ToolArgumentError("invalid unified diff header")
+            candidates = fields[2:]
+        elif line.startswith("--- ") or line.startswith("+++ "):
+            raw_value = line[4:].split("\t", 1)[0]
+            if raw_value.startswith('"'):
+                try:
+                    parsed_path = shlex.split(raw_value)
+                except ValueError as exc:
+                    raise ToolArgumentError("invalid unified diff path") from exc
+                if len(parsed_path) != 1:
+                    raise ToolArgumentError("invalid quoted unified diff path")
+                candidates = parsed_path
+            else:
+                candidates = [raw_value]
+        else:
+            continue
+        for candidate in candidates:
+            if candidate == "/dev/null":
+                continue
+            if candidate.startswith(("a/", "b/")):
+                candidate = candidate[2:]
+            _, display_path = _resolve_patch_path(candidate)
+            paths.append(display_path)
+    unique_paths = list(dict.fromkeys(paths))
+    if not unique_paths:
+        raise ToolArgumentError("unified diff does not contain a file path")
+    if len(unique_paths) > MAX_PATCH_FILES:
+        raise ToolArgumentError(
+            f"a patch must not change more than {MAX_PATCH_FILES} files"
+        )
+    return unique_paths
+
+
+def apply_patch(
+    arguments: dict[str, Any], timeout_seconds: float = PATCH_TIMEOUT_SECONDS
+) -> dict[str, Any]:
+    patch_text = _validated_patch_text(arguments)
+    if patch_text.startswith("*** Begin Patch"):
+        sections = _parse_apply_patch(patch_text)
+        changes = _prepare_apply_patch_changes(sections)
+        _write_patch_changes(changes)
+        paths = [section["path"] for section in sections]
+    else:
+        paths = _unified_patch_paths(patch_text)
+        timeout = min(timeout_seconds, PATCH_TIMEOUT_SECONDS)
+        command = ["git", "apply", "--whitespace=nowarn", "-"]
+        try:
+            checked = subprocess.run(
+                [*command[:2], "--check", *command[2:]],
+                cwd=_repository_root(),
+                input=patch_text,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+                check=False,
+            )
+            if checked.returncode != 0:
+                output, _ = _truncate_output(checked.stdout)
+                raise ToolArgumentError(f"patch does not apply: {output}")
+            applied = subprocess.run(
+                command,
+                cwd=_repository_root(),
+                input=patch_text,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ToolArgumentError("patch application timed out") from exc
+        if applied.returncode != 0:
+            output, _ = _truncate_output(applied.stdout)
+            raise ToolArgumentError(f"patch application failed: {output}")
+    return {"applied": True, "paths": paths, "file_count": len(paths)}
+
+
+def _prepare_shell_command(command_text: str) -> tuple[list[str], str]:
+    if not command_text.strip():
+        raise ToolArgumentError("argument 'command' must not be empty")
+    if len(command_text) > MAX_SHELL_COMMAND_CHARS:
+        raise ToolArgumentError(
+            f"argument 'command' must not exceed {MAX_SHELL_COMMAND_CHARS} characters"
+        )
+    try:
+        tokens = shlex.split(command_text)
+    except ValueError as exc:
+        raise ToolArgumentError("command has invalid quoting") from exc
+    if not tokens:
+        raise ToolArgumentError("argument 'command' must not be empty")
+
+    git_prefix = [
+        "git",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.hooksPath=/dev/null",
+    ]
+    if tokens == ["git", "status", "--short"]:
+        return [*git_prefix, "status", "--short"], command_text
+    if tokens in (
+        ["git", "diff", "--check"],
+        ["git", "diff", "--cached", "--check"],
+    ):
+        return [
+            *git_prefix,
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            *tokens[2:],
+        ], command_text
+    if tokens[:2] == ["git", "diff"] and (
+        len(tokens) == 2 or (len(tokens) == 4 and tokens[2] == "--")
+    ):
+        prepared = [
+            *git_prefix,
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+        ]
+        if len(tokens) == 4:
+            _, display_path = _resolve_repository_path(tokens[3])
+            prepared.extend(["--", display_path])
+        return prepared, command_text
+    if len(tokens) == 3 and tokens[0] == "rg":
+        query = tokens[1]
+        if not query:
+            raise ToolArgumentError("rg query must not be empty")
+        if len(query) > 200:
+            raise ToolArgumentError("rg query must not exceed 200 characters")
+        _, display_path = _resolve_repository_path(tokens[2])
+        return [
+            "rg",
+            "--line-number",
+            "--fixed-strings",
+            "--no-heading",
+            "--color",
+            "never",
+            "--",
+            query,
+            display_path,
+        ], command_text
+    if tokens == [
+        ".venv/bin/python",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-v",
+    ]:
+        python = _repository_root() / ".venv" / "bin" / "python"
+        if not python.is_file():
+            raise ToolArgumentError("repository virtual environment is missing: .venv")
+        return [str(python), *tokens[1:]], command_text
+    allowed = "; ".join(ALLOWED_SHELL_COMMANDS)
+    raise ToolArgumentError(f"command is not allowlisted; allowed forms: {allowed}")
+
+
+def _sandbox_ignore(directory: str, names: list[str]) -> set[str]:
+    ignored: set[str] = set()
+    relative_directory = Path(directory).resolve().relative_to(_repository_root())
+    for name in names:
+        relative = relative_directory / name
+        if name in EXCLUDED_DIRECTORY_NAMES - {".git"}:
+            ignored.add(name)
+        elif _is_sensitive_path(relative) and ".git" not in relative.parts:
+            ignored.add(name)
+        elif name == "events.jsonl":
+            ignored.add(name)
+    return ignored
+
+
+def _sandbox_environment() -> dict[str, str]:
+    """Keep basic process settings while withholding credentials and proxies."""
+    allowed_names = {
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "PATH",
+        "SYSTEMROOT",
+        "TEMP",
+        "TERM",
+        "TMP",
+        "TMPDIR",
+        "WINDIR",
+    }
+    environment = {
+        name: value for name, value in os.environ.items() if name in allowed_names
+    }
+    environment.update(
+        {
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+    )
+    return environment
+
+
+def run_shell(
+    arguments: dict[str, Any], timeout_seconds: float = SHELL_TIMEOUT_SECONDS
+) -> dict[str, Any]:
+    validated = _require_exact_arguments(arguments, required={"command": str})
+    command, display_command = _prepare_shell_command(validated["command"])
+    with tempfile.TemporaryDirectory(prefix="harness-sandbox-") as temporary:
+        sandbox_root = Path(temporary) / "repository"
+        try:
+            shutil.copytree(
+                _repository_root(),
+                sandbox_root,
+                symlinks=True,
+                ignore=_sandbox_ignore,
+            )
+        except OSError as exc:
+            raise ToolArgumentError("could not create disposable sandbox") from exc
+        result = _run_bounded_process(
+            command,
+            keep_tail=True,
+            timeout_seconds=min(timeout_seconds, SHELL_TIMEOUT_SECONDS),
+            cwd=sandbox_root,
+            env=_sandbox_environment(),
+        )
+    result["command"] = display_command
+    result["sandbox"] = "disposable repository copy"
     return result
 
 
@@ -834,7 +1361,54 @@ TOOL_HANDLERS = {
     "search_text": search_text,
     "git_diff": git_diff,
     "run_tests": run_tests,
+    "apply_patch": apply_patch,
+    "run_shell": run_shell,
 }
+APPROVAL_REQUIRED_TOOLS = {"apply_patch", "run_shell", "run_tests"}
+
+
+def _validate_approval_gated_call(name: str, arguments: dict[str, Any]) -> None:
+    """Validate a gated call before asking a person to approve it."""
+    if name == "apply_patch":
+        patch_text = _validated_patch_text(arguments)
+        if patch_text.startswith("*** Begin Patch"):
+            sections = _parse_apply_patch(patch_text)
+            _prepare_apply_patch_changes(sections)
+        else:
+            _unified_patch_paths(patch_text)
+    elif name == "run_shell":
+        validated = _require_exact_arguments(arguments, required={"command": str})
+        _prepare_shell_command(validated["command"])
+    elif name == "run_tests":
+        _require_exact_arguments(arguments, required={})
+        _prepare_shell_command(
+            ".venv/bin/python -m unittest discover -s tests -v"
+        )
+
+
+def _approval_summary(name: str, arguments: dict[str, Any]) -> str:
+    if name == "run_shell":
+        return f"run_shell: {arguments['command']}"
+    if name == "run_tests":
+        return "run_tests: .venv/bin/python -m unittest discover -s tests -v"
+    patch_text = arguments["patch"]
+    if patch_text.startswith("*** Begin Patch"):
+        paths = [section["path"] for section in _parse_apply_patch(patch_text)]
+    else:
+        paths = _unified_patch_paths(patch_text)
+    return f"apply_patch: {', '.join(paths)}"
+
+
+def _prompt_for_tool_approval(name: str, arguments: dict[str, Any]) -> bool:
+    """Ask for a local terminal approval, failing closed without a TTY."""
+    if not sys.stdin.isatty():
+        return False
+    summary = _approval_summary(name, arguments)
+    try:
+        answer = input(f"\napproval required> {summary}\nAllow? [y/N] ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return answer.lower() in {"y", "yes"}
 
 
 def execute_tool(
@@ -842,8 +1416,12 @@ def execute_tool(
     raw_arguments: str | None,
     *,
     timeout_seconds: float | None = None,
+    approval_policy: str = "deny",
+    approval_callback: Callable[[str, dict[str, Any]], bool] | None = None,
+    timeout_provider: Callable[[], float] | None = None,
 ) -> dict[str, Any]:
     """Parse, validate, and execute one tool call as a serializable envelope."""
+    approval: str | None = None
     try:
         if raw_arguments is None:
             raise ToolArgumentError("tool arguments are missing")
@@ -855,20 +1433,44 @@ def execute_tool(
         handler = TOOL_HANDLERS.get(name)
         if handler is None:
             raise ToolArgumentError(f"unknown tool: {name}")
-        if name in {"git_diff", "run_tests"} and timeout_seconds is not None:
-            return {
-                "ok": True,
-                "result": handler(arguments, timeout_seconds=timeout_seconds),
-            }
-        return {"ok": True, "result": handler(arguments)}
+        if name in APPROVAL_REQUIRED_TOOLS:
+            _validate_approval_gated_call(name, arguments)
+            if approval_policy not in APPROVAL_POLICIES:
+                raise ToolArgumentError(f"unknown approval policy: {approval_policy}")
+            if approval_policy == "allow":
+                approved = True
+            elif approval_policy == "ask" and approval_callback is not None:
+                approved = approval_callback(name, arguments)
+            else:
+                approved = False
+            approval = "granted" if approved else "denied"
+            if not approved:
+                raise ApprovalDeniedError(
+                    f"approval denied for side-effecting tool: {name}"
+                )
+        if name in {"git_diff", "run_tests", "apply_patch", "run_shell"} and (
+            timeout_seconds is not None
+        ):
+            if timeout_provider is not None:
+                timeout_seconds = min(timeout_seconds, timeout_provider())
+            result = handler(arguments, timeout_seconds=timeout_seconds)
+        else:
+            result = handler(arguments)
+        envelope = {"ok": True, "result": result}
+        if approval is not None:
+            envelope["approval"] = approval
+        return envelope
     except Exception as exc:
-        return {
+        envelope = {
             "ok": False,
             "error": {
                 "type": type(exc).__name__,
                 "message": str(exc),
             },
         }
+        if approval is not None:
+            envelope["approval"] = approval
+        return envelope
 
 
 def _tool_call_as_message(call: Any) -> dict[str, Any]:
@@ -950,6 +1552,7 @@ def run_turn(
     )
     max_turns = getattr(args, "max_turns", DEFAULT_MAX_TURNS)
     timeout_seconds = getattr(args, "timeout", DEFAULT_TIMEOUT_SECONDS)
+    approval_policy = getattr(args, "approval_policy", "deny")
     started_at = time.monotonic()
     deadline = started_at + timeout_seconds
     responses: list[Any] = []
@@ -957,8 +1560,26 @@ def run_turn(
         "agent_loop_started",
         max_turns=max_turns,
         timeout_seconds=timeout_seconds,
+        approval_policy=approval_policy,
+        sandbox=getattr(args, "sandbox", "disposable"),
         available_tools=sorted(TOOL_HANDLERS),
     )
+
+    def request_approval(name: str, arguments: dict[str, Any]) -> bool:
+        summary = _approval_summary(name, arguments)
+        event_logger.log(
+            "tool_approval_requested",
+            tool=name,
+            summary=summary,
+        )
+        approved = _prompt_for_tool_approval(name, arguments)
+        event_logger.log(
+            "tool_approval_resolved",
+            tool=name,
+            summary=summary,
+            approved=approved,
+        )
+        return approved
 
     try:
         for turn_number in range(1, max_turns + 1):
@@ -1117,6 +1738,9 @@ def run_turn(
                     name,
                     raw_arguments,
                     timeout_seconds=tool_timeout,
+                    approval_policy=approval_policy,
+                    approval_callback=request_approval,
+                    timeout_provider=lambda: _remaining_seconds(deadline),
                 )
                 elapsed_ms = round(
                     (time.monotonic() - tool_started_at) * 1_000, 2
@@ -1195,7 +1819,7 @@ def interactive_cli(
         )
         return 2
 
-    print("Harness Stage 3. Type /help for help or /exit to quit.")
+    print("Harness Stage 4. Type /help for help or /exit to quit.")
     while True:
         try:
             prompt = input("\nyou> ").strip()
@@ -1239,6 +1863,8 @@ def main(argv: list[str] | None = None) -> int:
         context_window_tokens=args.context_window,
         max_turns=args.max_turns,
         timeout_seconds=args.timeout,
+        approval_policy=args.approval_policy,
+        sandbox=args.sandbox,
         available_tools=sorted(TOOL_HANDLERS),
         interactive=args.prompt is None,
     )

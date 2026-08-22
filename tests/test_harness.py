@@ -1,7 +1,6 @@
 import argparse
 import io
 import json
-import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -18,6 +17,8 @@ def make_args(**overrides):
         "reasoning_effort": "medium",
         "max_completion_tokens": 100,
         "context_window": 1_000,
+        "approval_policy": "deny",
+        "sandbox": "disposable",
     }
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -66,6 +67,8 @@ class ParseArgsTests(unittest.TestCase):
         self.assertEqual(args.log_file, Path("events.jsonl"))
         self.assertEqual(args.max_turns, 8)
         self.assertEqual(args.timeout, 30.0)
+        self.assertEqual(args.approval_policy, "ask")
+        self.assertEqual(args.sandbox, "disposable")
 
     def test_prompt_and_flags_are_parsed(self):
         args = harness.parse_args(
@@ -101,7 +104,7 @@ class ParseArgsTests(unittest.TestCase):
 
 
 class ToolTests(unittest.TestCase):
-    def test_declares_strict_input_schemas_for_stage_three_tools(self):
+    def test_declares_strict_input_schemas_for_stage_four_tools(self):
         names = {tool["function"]["name"] for tool in harness.TOOLS}
 
         self.assertEqual(
@@ -115,6 +118,8 @@ class ToolTests(unittest.TestCase):
                 "search_text",
                 "git_diff",
                 "run_tests",
+                "apply_patch",
+                "run_shell",
             },
         )
         for tool in harness.TOOLS:
@@ -292,17 +297,23 @@ class RepositoryToolTests(unittest.TestCase):
             len(result["output"].splitlines()), harness.MAX_PROCESS_OUTPUT_LINES
         )
 
-    @patch("harness.subprocess.run")
+    @patch("harness._run_bounded_process")
     def test_run_tests_uses_the_repository_virtual_environment(self, run):
         python = self.root / ".venv/bin/python"
         python.parent.mkdir(parents=True)
         python.touch()
-        run.return_value = SimpleNamespace(returncode=1, stdout="failure details")
+        run.return_value = {
+            "exit_code": 1,
+            "output": "failure details",
+            "truncated": False,
+            "timed_out": False,
+        }
 
         result = harness.run_tests({})
 
+        command = run.call_args.args[0]
         self.assertEqual(
-            run.call_args.args[0],
+            command,
             [
                 str(python),
                 "-m",
@@ -315,22 +326,199 @@ class RepositoryToolTests(unittest.TestCase):
         )
         self.assertEqual(result["exit_code"], 1)
         self.assertEqual(result["output"], "failure details")
-        self.assertEqual(run.call_args.kwargs["timeout"], harness.TEST_TIMEOUT_SECONDS)
+        self.assertEqual(
+            run.call_args.kwargs["timeout_seconds"], harness.SHELL_TIMEOUT_SECONDS
+        )
+        self.assertNotEqual(run.call_args.kwargs["cwd"], self.root)
+        self.assertEqual(result["sandbox"], "disposable repository copy")
 
-    @patch(
-        "harness.subprocess.run",
-        side_effect=subprocess.TimeoutExpired(["tests"], 60, output="partial"),
-    )
-    def test_run_tests_reports_timeouts_as_bounded_results(self, _run):
+    @patch("harness._run_bounded_process")
+    def test_run_tests_reports_timeouts_as_bounded_results(self, run):
         python = self.root / ".venv/bin/python"
         python.parent.mkdir(parents=True)
         python.touch()
+        run.return_value = {
+            "exit_code": None,
+            "output": "partial",
+            "truncated": False,
+            "timed_out": True,
+        }
 
         result = harness.run_tests({})
 
         self.assertTrue(result["timed_out"])
         self.assertIsNone(result["exit_code"])
         self.assertEqual(result["output"], "partial")
+
+
+class EditingAndShellToolTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.root = Path(self.temp_dir.name).resolve()
+        self.root_patch = patch("harness._repository_root", return_value=self.root)
+        self.root_patch.start()
+        self.addCleanup(self.root_patch.stop)
+
+    def write_text(self, relative_path, content):
+        path = self.root / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    def test_apply_patch_updates_adds_and_deletes_text_files(self):
+        self.write_text("update.txt", "old\nkeep\n")
+        self.write_text("delete.txt", "gone\n")
+        patch_text = """*** Begin Patch
+*** Update File: update.txt
+@@
+-old
++new
+ keep
+*** Add File: nested/added.txt
++created
+*** Delete File: delete.txt
+-gone
+*** End Patch"""
+
+        result = harness.apply_patch({"patch": patch_text})
+
+        self.assertTrue(result["applied"])
+        self.assertEqual(result["file_count"], 3)
+        self.assertEqual((self.root / "update.txt").read_text(), "new\nkeep\n")
+        self.assertEqual((self.root / "nested/added.txt").read_text(), "created\n")
+        self.assertFalse((self.root / "delete.txt").exists())
+
+    def test_apply_patch_validates_every_hunk_before_writing(self):
+        self.write_text("one.txt", "one\n")
+        self.write_text("two.txt", "two\n")
+        patch_text = """*** Begin Patch
+*** Update File: one.txt
+@@
+-one
++changed
+*** Update File: two.txt
+@@
+-missing
++changed
+*** End Patch"""
+
+        with self.assertRaisesRegex(harness.ToolArgumentError, "does not match"):
+            harness.apply_patch({"patch": patch_text})
+
+        self.assertEqual((self.root / "one.txt").read_text(), "one\n")
+        self.assertEqual((self.root / "two.txt").read_text(), "two\n")
+
+    def test_apply_patch_rejects_paths_outside_the_repository(self):
+        patch_text = """*** Begin Patch
+*** Add File: ../outside.txt
++unsafe
+*** End Patch"""
+
+        with self.assertRaisesRegex(harness.ToolArgumentError, "must not contain"):
+            harness.apply_patch({"patch": patch_text})
+
+    def test_apply_patch_rejects_symlink_aliases(self):
+        self.write_text("target.txt", "safe\n")
+        (self.root / "alias.txt").symlink_to("target.txt")
+        patch_text = """*** Begin Patch
+*** Update File: alias.txt
+@@
+-safe
++changed
+*** End Patch"""
+
+        with self.assertRaisesRegex(harness.ToolArgumentError, "symlinks"):
+            harness.apply_patch({"patch": patch_text})
+
+        self.assertEqual((self.root / "target.txt").read_text(), "safe\n")
+
+    def test_apply_patch_accepts_a_unified_diff(self):
+        self.write_text("example.txt", "before\n")
+        patch_text = """diff --git a/example.txt b/example.txt
+--- a/example.txt
++++ b/example.txt
+@@ -1 +1 @@
+-before
++after
+"""
+
+        result = harness.apply_patch({"patch": patch_text})
+
+        self.assertTrue(result["applied"])
+        self.assertEqual((self.root / "example.txt").read_text(), "after\n")
+
+    @patch("harness._run_bounded_process")
+    def test_run_shell_uses_a_disposable_repository_copy(self, run_process):
+        self.write_text("tracked.txt", "content\n")
+        captured = {}
+
+        def run_in_sandbox(command, **kwargs):
+            captured["command"] = command
+            captured["cwd"] = kwargs["cwd"]
+            (kwargs["cwd"] / "side-effect.txt").write_text("temporary")
+            return {
+                "exit_code": 0,
+                "output": "ok",
+                "truncated": False,
+                "timed_out": False,
+            }
+
+        run_process.side_effect = run_in_sandbox
+
+        with patch.dict("harness.os.environ", {"CEREBRAS_API_KEY": "secret"}):
+            result = harness.run_shell({"command": "git status --short"})
+
+        self.assertEqual(result["sandbox"], "disposable repository copy")
+        self.assertEqual(result["output"], "ok")
+        self.assertFalse((self.root / "side-effect.txt").exists())
+        self.assertNotEqual(captured["cwd"], self.root)
+        self.assertEqual(captured["command"][0], "git")
+        self.assertNotIn("CEREBRAS_API_KEY", run_process.call_args.kwargs["env"])
+
+    @patch("harness.shutil.copytree")
+    def test_run_shell_rejects_non_allowlisted_commands_before_copying(self, copytree):
+        invalid = (
+            "rm -rf .",
+            "git status --short; rm file",
+            "python -c 'print(1)'",
+            "rg needle ../outside",
+        )
+
+        for command in invalid:
+            with self.subTest(command=command), self.assertRaises(
+                harness.ToolArgumentError
+            ):
+                harness.run_shell({"command": command})
+
+        copytree.assert_not_called()
+
+    def test_execute_tool_denies_or_grants_side_effecting_calls_by_policy(self):
+        denied_patch = """*** Begin Patch
+*** Add File: denied.txt
++no
+*** End Patch"""
+        denied = harness.execute_tool(
+            "apply_patch",
+            json.dumps({"patch": denied_patch}),
+        )
+
+        self.assertFalse(denied["ok"])
+        self.assertEqual(denied["approval"], "denied")
+        self.assertEqual(denied["error"]["type"], "ApprovalDeniedError")
+        self.assertFalse((self.root / "denied.txt").exists())
+
+        allowed_patch = denied_patch.replace("denied.txt", "allowed.txt")
+        allowed = harness.execute_tool(
+            "apply_patch",
+            json.dumps({"patch": allowed_patch}),
+            approval_policy="ask",
+            approval_callback=lambda _name, _arguments: True,
+        )
+
+        self.assertTrue(allowed["ok"])
+        self.assertEqual(allowed["approval"], "granted")
+        self.assertEqual((self.root / "allowed.txt").read_text(), "no\n")
 
 
 class MetricsTests(unittest.TestCase):
@@ -487,6 +675,42 @@ class RunTurnTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"]["type"], "ToolArgumentError")
         self.assertEqual(messages[-1]["content"], "I could not calculate that.")
+
+    @patch("harness._prompt_for_tool_approval", return_value=False)
+    def test_denied_approval_is_logged_and_returned_to_the_model(self, _approval):
+        self.args.approval_policy = "ask"
+        client = Mock()
+        client.chat.completions.create.side_effect = [
+            make_response(
+                content=None,
+                tool_calls=[
+                    make_tool_call(
+                        name="run_shell",
+                        arguments='{"command":"git status --short"}',
+                    )
+                ],
+            ),
+            make_response(content="The command was not approved."),
+        ]
+        messages = [{"role": "system", "content": "test"}]
+
+        with redirect_stdout(io.StringIO()):
+            harness.run_turn(client, messages, "Check status", self.args, self.logger)
+
+        tool_result = json.loads(messages[3]["content"])
+        self.assertFalse(tool_result["ok"])
+        self.assertEqual(tool_result["approval"], "denied")
+        self.assertEqual(tool_result["error"]["type"], "ApprovalDeniedError")
+        approval_events = [
+            event
+            for event in self.read_events()
+            if event["event"].startswith("tool_approval_")
+        ]
+        self.assertEqual(
+            [event["event"] for event in approval_events],
+            ["tool_approval_requested", "tool_approval_resolved"],
+        )
+        self.assertFalse(approval_events[-1]["approved"])
 
     def test_max_turns_stops_loop_and_rolls_back_history(self):
         self.args.max_turns = 1
