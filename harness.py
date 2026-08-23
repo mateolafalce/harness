@@ -6,20 +6,23 @@ from __future__ import annotations
 import argparse
 import ast
 import copy
+import hashlib
 import json
 import math
 import os
 import re
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from cerebras.cloud.sdk import Cerebras
@@ -34,9 +37,11 @@ DEFAULT_TIMEOUT_SECONDS = 30.0
 DEFAULT_COMPACTION_THRESHOLD = 0.70
 DEFAULT_RECENT_TURNS = 2
 DEFAULT_RELEVANT_FILES = 8
-DEFAULT_SESSION_FILE = Path(".harness/session.json")
-DEFAULT_PROGRESS_FILE = Path(".harness/progress.md")
-SESSION_SCHEMA_VERSION = 1
+DEFAULT_STATE_FILE = Path(".harness/harness.db")
+LEGACY_SESSION_FILE = Path(".harness/session.json")
+LEGACY_PROGRESS_FILE = Path(".harness/progress.md")
+STATE_SCHEMA_VERSION = 1
+LEGACY_SESSION_SCHEMA_VERSION = 1
 PRIVATE_RUNTIME_PATHS: set[str] = set()
 MAX_LISTED_FILES = 500
 MAX_READ_LINES = 200
@@ -46,6 +51,7 @@ MAX_INSTRUCTION_FILE_CHARS = 24_000
 MAX_INSTRUCTION_CONTEXT_CHARS = 64_000
 MAX_COMPACTION_SUMMARY_CHARS = 8_000
 MAX_PROGRESS_CHARS = 8_000
+MAX_EVENT_PAYLOAD_CHARS = 32_000
 MAX_SEARCH_RESULTS = 50
 MAX_SEARCH_LINE_CHARS = 240
 MAX_SEARCH_FILE_BYTES = 1_000_000
@@ -376,23 +382,31 @@ def ratio_float(value: str) -> float:
     return number
 
 
-class JsonlEventLogger:
-    """Append structured session events to a JSON Lines file."""
+class EventLogger:
+    """Persist ordered audit events, with optional JSONL export."""
 
-    def __init__(self, path: Path, session_id: str | None = None) -> None:
-        self.path = path
-        self.session_id = session_id or str(uuid.uuid4())
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            PRIVATE_RUNTIME_PATHS.add(
-                self.path.resolve().relative_to(Path.cwd().resolve()).as_posix()
-            )
-        except ValueError:
-            pass
+    def __init__(
+        self,
+        store: SessionStore,
+        session_id: str,
+        export_path: Path | None = None,
+    ) -> None:
+        self.store = store
+        self.session_id = session_id
+        self.path = (
+            _validated_runtime_path(export_path) if export_path is not None else None
+        )
+        if self.path is not None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            _register_private_runtime_path(self.path)
 
     def log(self, event: str, **data: Any) -> None:
+        timestamp = datetime.now(timezone.utc).isoformat()
+        self.store.log_event(self.session_id, timestamp, event, data)
+        if self.path is None:
+            return
         record = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": timestamp,
             "session_id": self.session_id,
             "event": event,
             **data,
@@ -472,25 +486,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--log-file",
         type=Path,
-        default=Path("events.jsonl"),
-        help="JSON Lines event log (default: events.jsonl).",
+        help="Optional JSON Lines export; SQLite remains the source of truth.",
     )
     parser.add_argument(
+        "--state-file",
         "--session-file",
+        dest="state_file",
         type=Path,
-        default=DEFAULT_SESSION_FILE,
-        help=f"Durable conversation state (default: {DEFAULT_SESSION_FILE}).",
+        default=DEFAULT_STATE_FILE,
+        help=f"SQLite state database (default: {DEFAULT_STATE_FILE}).",
     )
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Resume messages and session identity from --session-file.",
+        help="Resume the latest repository session from --state-file.",
     )
     parser.add_argument(
         "--progress-file",
         type=Path,
-        default=DEFAULT_PROGRESS_FILE,
-        help=f"Long-running task notes (default: {DEFAULT_PROGRESS_FILE}).",
+        default=LEGACY_PROGRESS_FILE,
+        help="Legacy progress file imported into SQLite when resuming.",
     )
     parser.add_argument(
         "--global-instructions",
@@ -823,6 +838,18 @@ def _validated_runtime_path(path: Path) -> Path:
     return candidate
 
 
+def _register_private_runtime_path(path: Path) -> None:
+    """Hide a runtime file and its SQLite sidecars from repository tools."""
+    root = _repository_root()
+    try:
+        relative = path.resolve().relative_to(root)
+    except ValueError:
+        return
+    PRIVATE_RUNTIME_PATHS.add(relative.as_posix())
+    for suffix in ("-journal", "-shm", "-wal"):
+        PRIVATE_RUNTIME_PATHS.add(f"{relative.as_posix()}{suffix}")
+
+
 def _atomic_write_text(path: Path, content: str, private: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
@@ -837,131 +864,490 @@ def _atomic_write_text(path: Path, content: str, private: bool = False) -> None:
 
 
 class SessionStore:
-    """Persist validated conversation state atomically for later resumption."""
+    """Persist sessions, immutable context snapshots, events, and checkpoints."""
 
     def __init__(self, path: Path, repository_root: Path) -> None:
         self.path = _validated_runtime_path(path)
         self.repository_root = repository_root.resolve()
-        PRIVATE_RUNTIME_PATHS.add(
-            self.path.relative_to(self.repository_root).as_posix()
-        )
+        self.artifact_directory = self.path.with_name(f"{self.path.name}.artifacts")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        _register_private_runtime_path(self.path)
+        _register_private_runtime_path(self.artifact_directory)
+        self._initialize()
 
-    def save(self, session_id: str, messages: list[dict[str, Any]]) -> None:
-        payload = {
-            "schema_version": SESSION_SCHEMA_VERSION,
-            "session_id": session_id,
-            "repository_root": str(self.repository_root),
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-            "messages": messages,
-        }
-        _atomic_write_text(
-            self.path,
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-            private=True,
-        )
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.path, timeout=5.0)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute("PRAGMA journal_mode = WAL")
+        return connection
 
-    def ensure_safe_to_replace(self) -> None:
-        """Reject overwriting an existing file that is not our session format."""
-        if not self.path.exists():
-            return
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        connection = self._connect()
         try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise RuntimeError(
-                f"refusing to overwrite non-session file: {self.path}"
-            ) from exc
-        if (
-            not isinstance(payload, dict)
-            or payload.get("schema_version") != SESSION_SCHEMA_VERSION
-            or payload.get("repository_root") != str(self.repository_root)
-        ):
-            raise RuntimeError(f"refusing to overwrite non-session file: {self.path}")
+            with connection:
+                yield connection
+        finally:
+            connection.close()
 
-    def load(self) -> tuple[str, list[dict[str, Any]]]:
+    def _initialize(self) -> None:
         try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except FileNotFoundError as exc:
-            raise RuntimeError(f"session file does not exist: {self.path}") from exc
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            with self._connection() as connection:
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+                if version > STATE_SCHEMA_VERSION:
+                    raise RuntimeError(
+                        f"state database schema {version} is newer than supported "
+                        f"schema {STATE_SCHEMA_VERSION}"
+                    )
+                existing_tables = {
+                    row[0]
+                    for row in connection.execute(
+                        """
+                        SELECT name FROM sqlite_master
+                        WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                        """
+                    )
+                }
+                if existing_tables and "harness_metadata" not in existing_tables:
+                    raise RuntimeError(
+                        f"refusing to use unrelated SQLite database: {self.path}"
+                    )
+                if "harness_metadata" in existing_tables:
+                    marker = connection.execute(
+                        """
+                        SELECT value FROM harness_metadata
+                        WHERE key = 'storage_format'
+                        """
+                    ).fetchone()
+                    if marker is None or marker[0] != "harness-sqlite":
+                        raise RuntimeError(
+                            f"refusing to use unrelated SQLite database: {self.path}"
+                        )
+                connection.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS harness_metadata (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS sessions (
+                        id TEXT PRIMARY KEY,
+                        repository_root TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        current_snapshot_id INTEGER
+                    );
+                    CREATE TABLE IF NOT EXISTS context_snapshots (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id TEXT NOT NULL REFERENCES sessions(id),
+                        reason TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS messages (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        snapshot_id INTEGER NOT NULL
+                            REFERENCES context_snapshots(id) ON DELETE CASCADE,
+                        sequence INTEGER NOT NULL,
+                        role TEXT NOT NULL CHECK (
+                            role IN ('system', 'user', 'assistant', 'tool')
+                        ),
+                        content_json TEXT NOT NULL,
+                        payload_json TEXT NOT NULL,
+                        UNIQUE(snapshot_id, sequence)
+                    );
+                    CREATE TABLE IF NOT EXISTS artifacts (
+                        id TEXT PRIMARY KEY,
+                        path TEXT NOT NULL,
+                        media_type TEXT NOT NULL,
+                        size_bytes INTEGER NOT NULL,
+                        created_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id TEXT NOT NULL,
+                        timestamp TEXT NOT NULL,
+                        event_type TEXT NOT NULL,
+                        payload_json TEXT NOT NULL,
+                        artifact_id TEXT REFERENCES artifacts(id)
+                    );
+                    CREATE INDEX IF NOT EXISTS events_session_order
+                        ON events(session_id, id);
+                    CREATE TABLE IF NOT EXISTS checkpoints (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id TEXT NOT NULL REFERENCES sessions(id),
+                        objective TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        actions_json TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS checkpoints_session_order
+                        ON checkpoints(session_id, id);
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO harness_metadata (key, value)
+                    VALUES ('storage_format', 'harness-sqlite')
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """
+                )
+                connection.execute(
+                    f"PRAGMA user_version = {STATE_SCHEMA_VERSION}"
+                )
+            self.path.chmod(0o600)
+        except (OSError, sqlite3.DatabaseError) as exc:
             raise RuntimeError(
-                f"could not load session file {self.path}: {exc}"
+                f"could not initialize state database {self.path}: {exc}"
             ) from exc
-        if (
-            not isinstance(payload, dict)
-            or payload.get("schema_version") != SESSION_SCHEMA_VERSION
-        ):
-            raise RuntimeError("unsupported or malformed session file")
-        if payload.get("repository_root") != str(self.repository_root):
-            raise RuntimeError("session belongs to a different repository")
-        session_id = payload.get("session_id")
-        messages = payload.get("messages")
-        if not isinstance(session_id, str) or not session_id:
-            raise RuntimeError("session file has no valid session_id")
+
+    @staticmethod
+    def _validate_messages(messages: list[dict[str, Any]]) -> None:
         if not isinstance(messages, list) or any(
             not isinstance(message, dict)
             or message.get("role") not in {"system", "user", "assistant", "tool"}
             for message in messages
         ):
-            raise RuntimeError("session file has malformed messages")
+            raise RuntimeError("session has malformed messages")
+
+    def save(
+        self,
+        session_id: str,
+        messages: list[dict[str, Any]],
+        reason: str = "checkpoint",
+    ) -> None:
+        """Atomically append an immutable snapshot and make it active."""
+        if not isinstance(session_id, str) or not session_id:
+            raise RuntimeError("session has no valid session_id")
+        self._validate_messages(messages)
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connection() as connection:
+            existing = connection.execute(
+                "SELECT repository_root FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if existing is not None and existing["repository_root"] != str(
+                self.repository_root
+            ):
+                raise RuntimeError("session belongs to a different repository")
+            connection.execute(
+                """
+                INSERT INTO sessions (
+                    id, repository_root, created_at, updated_at, status
+                ) VALUES (?, ?, ?, ?, 'active')
+                ON CONFLICT(id) DO UPDATE SET
+                    updated_at = excluded.updated_at,
+                    status = excluded.status
+                """,
+                (session_id, str(self.repository_root), now, now),
+            )
+            cursor = connection.execute(
+                """
+                INSERT INTO context_snapshots (session_id, reason, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (session_id, reason, now),
+            )
+            snapshot_id = cursor.lastrowid
+            for sequence, message in enumerate(messages):
+                payload = dict(message)
+                role = payload.pop("role")
+                content = payload.pop("content", None)
+                connection.execute(
+                    """
+                    INSERT INTO messages (
+                        snapshot_id, sequence, role, content_json, payload_json
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        snapshot_id,
+                        sequence,
+                        role,
+                        json.dumps(content, ensure_ascii=False, default=str),
+                        json.dumps(payload, ensure_ascii=False, default=str),
+                    ),
+                )
+            connection.execute(
+                """
+                UPDATE sessions
+                SET current_snapshot_id = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (snapshot_id, now, session_id),
+            )
+
+    def ensure_safe_to_replace(self) -> None:
+        """Compatibility no-op; initialization already validates the database."""
+
+    def load(self) -> tuple[str, list[dict[str, Any]]]:
+        with self._connection() as connection:
+            session = connection.execute(
+                """
+                SELECT id, current_snapshot_id
+                FROM sessions
+                WHERE repository_root = ? AND current_snapshot_id IS NOT NULL
+                ORDER BY updated_at DESC, rowid DESC
+                LIMIT 1
+                """,
+                (str(self.repository_root),),
+            ).fetchone()
+            if session is None:
+                raise RuntimeError(
+                    f"state database has no session for {self.repository_root}"
+                )
+            rows = connection.execute(
+                """
+                SELECT role, content_json, payload_json
+                FROM messages
+                WHERE snapshot_id = ?
+                ORDER BY sequence
+                """,
+                (session["current_snapshot_id"],),
+            ).fetchall()
+        messages = []
+        for row in rows:
+            message = {"role": row["role"], "content": json.loads(row["content_json"])}
+            message.update(json.loads(row["payload_json"]))
+            messages.append(message)
+        self._validate_messages(messages)
+        return session["id"], messages
+
+    def has_sessions(self) -> bool:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM sessions WHERE repository_root = ? LIMIT 1",
+                (str(self.repository_root),),
+            ).fetchone()
+        return row is not None
+
+    def import_legacy_session(self, path: Path) -> tuple[str, list[dict[str, Any]]]:
+        """Import the previous JSON session format without deleting its source."""
+        legacy_path = _validated_runtime_path(path)
+        try:
+            payload = json.loads(legacy_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"could not load legacy session file {legacy_path}: {exc}"
+            ) from exc
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema_version") != LEGACY_SESSION_SCHEMA_VERSION
+        ):
+            raise RuntimeError("unsupported or malformed legacy session file")
+        if payload.get("repository_root") != str(self.repository_root):
+            raise RuntimeError("legacy session belongs to a different repository")
+        session_id = payload.get("session_id")
+        messages = payload.get("messages")
+        if not isinstance(session_id, str) or not session_id:
+            raise RuntimeError("legacy session file has no valid session_id")
+        self._validate_messages(messages)
+        self.save(session_id, messages, reason="legacy_import")
         return session_id, messages
+
+    def log_event(
+        self,
+        session_id: str,
+        timestamp: str,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> None:
+        serialized = json.dumps(payload, ensure_ascii=False, default=str)
+        with self._connection() as connection:
+            artifact_id = None
+            stored_payload = serialized
+            if len(serialized) > MAX_EVENT_PAYLOAD_CHARS:
+                artifact_id = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+                artifact_path = self.artifact_directory / f"{artifact_id}.json"
+                if not artifact_path.exists():
+                    _atomic_write_text(artifact_path, serialized + "\n", private=True)
+                _register_private_runtime_path(artifact_path)
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO artifacts (
+                        id, path, media_type, size_bytes, created_at
+                    ) VALUES (?, ?, 'application/json', ?, ?)
+                    """,
+                    (
+                        artifact_id,
+                        str(artifact_path.relative_to(self.repository_root)),
+                        len(serialized.encode("utf-8")),
+                        timestamp,
+                    ),
+                )
+                stored_payload = json.dumps(
+                    {
+                        "artifact_id": artifact_id,
+                        "artifact_size_bytes": len(serialized.encode("utf-8")),
+                        "notice": "Full event payload stored as a content-addressed artifact.",
+                    }
+                )
+            connection.execute(
+                """
+                INSERT INTO events (
+                    session_id, timestamp, event_type, payload_json, artifact_id
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    timestamp,
+                    event_type,
+                    stored_payload,
+                    artifact_id,
+                ),
+            )
+            if event_type == "session_ended":
+                connection.execute(
+                    "UPDATE sessions SET status = 'ended' WHERE id = ?",
+                    (session_id,),
+                )
+
+    def events(self, session_id: str | None = None) -> list[dict[str, Any]]:
+        query = """
+            SELECT events.session_id, events.timestamp, events.event_type,
+                   events.payload_json, artifacts.path AS artifact_path
+            FROM events
+            LEFT JOIN artifacts ON artifacts.id = events.artifact_id
+        """
+        parameters: tuple[str, ...] = ()
+        if session_id is not None:
+            query += " WHERE session_id = ?"
+            parameters = (session_id,)
+        query += " ORDER BY events.id"
+        with self._connection() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        events = []
+        for row in rows:
+            payload = json.loads(row["payload_json"])
+            if row["artifact_path"]:
+                artifact_path = self.repository_root / row["artifact_path"]
+                try:
+                    payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    payload["artifact_unavailable"] = True
+            events.append(
+                {
+                    "timestamp": row["timestamp"],
+                    "session_id": row["session_id"],
+                    "event": row["event_type"],
+                    **payload,
+                }
+            )
+        return events
+
+    def save_progress(
+        self,
+        session_id: str,
+        objective: str,
+        status: str,
+        actions: list[str],
+    ) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO checkpoints (
+                    session_id, objective, status, actions_json, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    objective,
+                    status,
+                    json.dumps(actions[-20:], ensure_ascii=False),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+
+    def load_progress(self, session_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT objective, status, actions_json, created_at
+                FROM checkpoints
+                WHERE session_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "objective": row["objective"],
+            "status": row["status"],
+            "actions": json.loads(row["actions_json"]),
+            "updated_at": row["created_at"],
+        }
 
 
 class ProgressTracker:
-    """Maintain compact, durable notes for interrupted long-running work."""
+    """Maintain compact, durable checkpoints for interrupted work."""
 
     def __init__(
-        self, path: Path, session_id: str, load_existing: bool = True
+        self, store: SessionStore, session_id: str, load_existing: bool = True
     ) -> None:
-        self.path = _validated_runtime_path(path)
+        self.store = store
         self.session_id = session_id
         self.objective = ""
         self.status = "idle"
         self.actions: list[str] = []
-        if self.path.is_file():
-            try:
-                with self.path.open(encoding="utf-8") as stream:
-                    first_line = stream.readline().rstrip()
-            except (OSError, UnicodeError) as exc:
-                raise ValueError(
-                    f"could not validate progress file: {self.path}"
-                ) from exc
-            if first_line != "# Harness progress":
-                raise ValueError(
-                    f"refusing to overwrite non-progress file: {self.path}"
-                )
-        if load_existing and self.path.is_file():
-            try:
-                previous = _read_context_file(self.path, MAX_PROGRESS_CHARS)
-            except RuntimeError:
-                previous = ""
-            objective_match = re.search(
-                r"## Current objective\s+(.*?)(?=\n## |\Z)", previous, re.DOTALL
-            )
-            if objective_match:
-                self.objective = objective_match.group(1).strip()
-            actions_match = re.search(
-                r"## Recent actions\s+(.*?)(?=\n## |\Z)", previous, re.DOTALL
-            )
-            if actions_match:
-                self.actions = [
-                    line[2:].strip()
-                    for line in actions_match.group(1).splitlines()
-                    if line.startswith("- ") and line != "- None yet."
-                ][-20:]
+        if load_existing:
+            checkpoint = self.store.load_progress(session_id)
+            if checkpoint is not None:
+                self.objective = checkpoint["objective"]
+                self.status = checkpoint["status"]
+                self.actions = checkpoint["actions"][-20:]
 
     def _write(self) -> None:
-        actions = self.actions[-20:]
+        self.actions = self.actions[-20:]
+        self.store.save_progress(
+            self.session_id, self.objective, self.status, self.actions
+        )
+
+    def render(self) -> str:
+        """Render the latest checkpoint as bounded model-facing context."""
+        checkpoint = self.store.load_progress(self.session_id)
+        updated_at = checkpoint["updated_at"] if checkpoint else "not persisted"
         content = (
             "# Harness progress\n\n"
             f"- Session: `{self.session_id}`\n"
-            f"- Updated: {datetime.now(timezone.utc).isoformat()}\n"
+            f"- Updated: {updated_at}\n"
             f"- Status: {self.status}\n\n"
             f"## Current objective\n\n{self.objective or 'Not set.'}\n\n"
             "## Recent actions\n\n"
-            + ("\n".join(f"- {action}" for action in actions) or "- None yet.")
+            + ("\n".join(f"- {action}" for action in self.actions) or "- None yet.")
             + "\n"
         )
-        _atomic_write_text(self.path, content[:MAX_PROGRESS_CHARS])
+        return content[:MAX_PROGRESS_CHARS]
+
+    def import_legacy(self, path: Path) -> bool:
+        """Import legacy Markdown progress when no checkpoint exists."""
+        if self.store.load_progress(self.session_id) is not None:
+            return False
+        legacy_path = _validated_runtime_path(path)
+        if not legacy_path.is_file():
+            return False
+        previous = _read_context_file(legacy_path, MAX_PROGRESS_CHARS)
+        if not previous.startswith("# Harness progress"):
+            raise ValueError(f"refusing to import non-progress file: {legacy_path}")
+        objective_match = re.search(
+            r"## Current objective\s+(.*?)(?=\n## |\Z)", previous, re.DOTALL
+        )
+        if objective_match:
+            self.objective = objective_match.group(1).strip()
+        status_match = re.search(r"^- Status:\s*(.+)$", previous, re.MULTILINE)
+        if status_match:
+            self.status = status_match.group(1).strip()
+        actions_match = re.search(
+            r"## Recent actions\s+(.*?)(?=\n## |\Z)", previous, re.DOTALL
+        )
+        if actions_match:
+            self.actions = [
+                line[2:].strip()
+                for line in actions_match.group(1).splitlines()
+                if line.startswith("- ") and line != "- None yet."
+            ][-20:]
+        self._write()
+        return True
 
     def start(self, prompt: str) -> None:
         if not self.objective:
@@ -1166,12 +1552,14 @@ def _is_sensitive_path(path: Path) -> bool:
         return True
     if path.as_posix() in PRIVATE_RUNTIME_PATHS:
         return True
-    if path.as_posix() == DEFAULT_SESSION_FILE.as_posix():
+    if path.as_posix() in {
+        DEFAULT_STATE_FILE.as_posix(),
+        LEGACY_SESSION_FILE.as_posix(),
+        LEGACY_PROGRESS_FILE.as_posix(),
+    }:
         return True
-    if path.name == "events.jsonl":
-        return True
-    if path.parent.as_posix() == DEFAULT_SESSION_FILE.parent.as_posix() and (
-        path.name.startswith(f".{DEFAULT_SESSION_FILE.name}.")
+    if path.name == "events.jsonl" or path.name.startswith(
+        f"{DEFAULT_STATE_FILE.name}-"
     ):
         return True
     return any(
@@ -1839,9 +2227,16 @@ def _prepare_shell_command(command_text: str) -> tuple[list[str], str]:
         "tests",
         "-v",
     ]:
-        python = _repository_root() / ".venv" / "bin" / "python"
+        configured_python = os.environ.get("HARNESS_PYTHON")
+        python = (
+            Path(configured_python)
+            if configured_python
+            else _repository_root() / ".venv" / "bin" / "python"
+        )
+        if configured_python and not python.is_absolute():
+            raise ToolArgumentError("HARNESS_PYTHON must be an absolute path")
         if not python.is_file():
-            raise ToolArgumentError("repository virtual environment is missing: .venv")
+            raise ToolArgumentError(f"test interpreter is missing: {python}")
         return [str(python), *tokens[1:]], command_text
     allowed = "; ".join(ALLOWED_SHELL_COMMANDS)
     raise ToolArgumentError(f"command is not allowlisted; allowed forms: {allowed}")
@@ -2104,7 +2499,7 @@ def run_turn(
     messages: list[dict[str, Any]],
     prompt: str,
     args: argparse.Namespace,
-    event_logger: JsonlEventLogger,
+    event_logger: EventLogger,
     session_store: SessionStore | None = None,
     progress_tracker: ProgressTracker | None = None,
 ) -> int:
@@ -2179,7 +2574,9 @@ def run_turn(
                     **compaction,
                 )
                 if session_store is not None:
-                    session_store.save(event_logger.session_id, messages)
+                    session_store.save(
+                        event_logger.session_id, messages, reason="compaction"
+                    )
             remaining = _remaining_seconds(deadline)
             event_logger.log(
                 "agent_turn_started",
@@ -2259,7 +2656,9 @@ def run_turn(
             if not tool_calls:
                 messages.append({"role": "assistant", "content": content})
                 if session_store is not None:
-                    session_store.save(event_logger.session_id, messages)
+                    session_store.save(
+                        event_logger.session_id, messages, reason="final_response"
+                    )
                 if progress_tracker is not None:
                     progress_tracker.complete(content)
                 event_logger.log(
@@ -2371,7 +2770,9 @@ def run_turn(
                     progress_tracker.record_tool(name, result["ok"])
                 _remaining_seconds(deadline)
             if session_store is not None:
-                session_store.save(event_logger.session_id, messages)
+                session_store.save(
+                    event_logger.session_id, messages, reason="tool_batch"
+                )
 
         _remaining_seconds(deadline)
         event_logger.log(
@@ -2386,7 +2787,7 @@ def run_turn(
     except (Exception, KeyboardInterrupt) as exc:
         messages[:] = history_snapshot
         if session_store is not None:
-            session_store.save(event_logger.session_id, messages)
+            session_store.save(event_logger.session_id, messages, reason="rollback")
         if progress_tracker is not None:
             progress_tracker.failed(exc)
         event_logger.log(
@@ -2401,7 +2802,7 @@ def run_turn(
 
 def clear_conversation_context(
     messages: list[dict[str, Any]],
-    event_logger: JsonlEventLogger,
+    event_logger: EventLogger,
     session_store: SessionStore | None = None,
 ) -> int:
     """Remove conversation turns while preserving the initial system prompt."""
@@ -2416,7 +2817,7 @@ def clear_conversation_context(
         history_message_count=len(messages),
     )
     if session_store is not None:
-        session_store.save(event_logger.session_id, messages)
+        session_store.save(event_logger.session_id, messages, reason="clear")
     return removed_count
 
 
@@ -2424,7 +2825,7 @@ def interactive_cli(
     client: Cerebras,
     messages: list[dict[str, Any]],
     args: argparse.Namespace,
-    event_logger: JsonlEventLogger,
+    event_logger: EventLogger,
     session_store: SessionStore | None = None,
     progress_tracker: ProgressTracker | None = None,
 ) -> int:
@@ -2471,7 +2872,9 @@ def interactive_cli(
                 getattr(args, "keep_recent_turns", DEFAULT_RECENT_TURNS),
             )
             if session_store is not None:
-                session_store.save(event_logger.session_id, messages)
+                session_store.save(
+                    event_logger.session_id, messages, reason="manual_compaction"
+                )
             if result is None:
                 print("Nothing old enough to compact.")
             else:
@@ -2505,17 +2908,34 @@ def main(argv: list[str] | None = None) -> int:
     load_dotenv(Path(__file__).resolve().with_name(".env"), override=False)
     root = _repository_root()
     session_id = str(uuid.uuid4())
+    session_store: SessionStore | None = None
+    legacy_session_imported = False
+    legacy_progress_imported = False
     try:
-        session_store = SessionStore(args.session_file, root)
+        session_store = SessionStore(args.state_file, root)
         if args.resume:
-            session_id, messages = session_store.load()
+            if not session_store.has_sessions() and (
+                root / LEGACY_SESSION_FILE
+            ).is_file():
+                session_id, messages = session_store.import_legacy_session(
+                    LEGACY_SESSION_FILE
+                )
+                legacy_session_imported = True
+            else:
+                session_id, messages = session_store.load()
         else:
-            session_store.ensure_safe_to_replace()
             messages = []
-        progress_path = _validated_runtime_path(args.progress_file)
+        progress_tracker = ProgressTracker(
+            session_store, session_id, load_existing=args.resume
+        )
+        if args.resume:
+            legacy_progress_imported = progress_tracker.import_legacy(
+                args.progress_file
+            )
         progress_context = (
-            _read_context_file(progress_path, MAX_PROGRESS_CHARS)
-            if args.resume and progress_path.is_file()
+            progress_tracker.render()
+            if args.resume
+            and session_store.load_progress(session_id) is not None
             else None
         )
         instruction_documents = load_instruction_documents(
@@ -2530,19 +2950,20 @@ def main(argv: list[str] | None = None) -> int:
             messages[0] = {"role": "system", "content": system_prompt}
         else:
             messages.insert(0, {"role": "system", "content": system_prompt})
-        progress_tracker = ProgressTracker(
-            args.progress_file, session_id, load_existing=args.resume
-        )
-        session_store.save(session_id, messages)
-    except (OSError, RuntimeError, ValueError) as exc:
-        event_logger = JsonlEventLogger(args.log_file, session_id)
+        session_store.save(session_id, messages, reason="session_initialized")
+        event_logger = EventLogger(session_store, session_id, args.log_file)
+    except (OSError, RuntimeError, ValueError, sqlite3.DatabaseError) as exc:
         message = f"could not initialize context state: {exc}"
-        event_logger.log("configuration_error", message=message)
-        event_logger.log("session_ended", exit_code=2)
+        if session_store is not None:
+            try:
+                event_logger = EventLogger(session_store, session_id, args.log_file)
+                event_logger.log("configuration_error", message=message)
+                event_logger.log("session_ended", exit_code=2)
+            except (OSError, RuntimeError, ValueError, sqlite3.DatabaseError):
+                pass
         print(f"Error: {message}", file=sys.stderr)
         return 2
 
-    event_logger = JsonlEventLogger(args.log_file, session_id)
     event_logger.log(
         "session_started",
         model=args.model,
@@ -2554,8 +2975,10 @@ def main(argv: list[str] | None = None) -> int:
         available_tools=sorted(TOOL_HANDLERS),
         interactive=args.prompt is None,
         resumed=args.resume,
-        session_file=str(session_store.path),
-        progress_file=str(progress_tracker.path),
+        state_file=str(session_store.path),
+        event_export_file=(str(event_logger.path) if event_logger.path else None),
+        legacy_session_imported=legacy_session_imported,
+        legacy_progress_imported=legacy_progress_imported,
         instruction_files=[label for label, _content in instruction_documents],
     )
 

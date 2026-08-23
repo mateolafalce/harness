@@ -1,6 +1,7 @@
 import argparse
 import io
 import json
+import sqlite3
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -64,7 +65,7 @@ class ParseArgsTests(unittest.TestCase):
 
         self.assertIsNone(args.prompt)
         self.assertEqual(args.context_window, 131_072)
-        self.assertEqual(args.log_file, Path("events.jsonl"))
+        self.assertIsNone(args.log_file)
         self.assertEqual(args.max_turns, 8)
         self.assertEqual(args.timeout, 30.0)
         self.assertEqual(args.approval_policy, "ask")
@@ -72,7 +73,7 @@ class ParseArgsTests(unittest.TestCase):
         self.assertEqual(args.compaction_threshold, 0.70)
         self.assertEqual(args.keep_recent_turns, 2)
         self.assertEqual(args.relevant_files, 8)
-        self.assertEqual(args.session_file, Path(".harness/session.json"))
+        self.assertEqual(args.state_file, Path(".harness/harness.db"))
         self.assertEqual(args.progress_file, Path(".harness/progress.md"))
         self.assertFalse(args.resume)
 
@@ -322,7 +323,8 @@ class RepositoryToolTests(unittest.TestCase):
             "timed_out": False,
         }
 
-        result = harness.run_tests({})
+        with patch.dict("harness.os.environ", {}, clear=True):
+            result = harness.run_tests({})
 
         command = run.call_args.args[0]
         self.assertEqual(
@@ -344,6 +346,24 @@ class RepositoryToolTests(unittest.TestCase):
         )
         self.assertNotEqual(run.call_args.kwargs["cwd"], self.root)
         self.assertEqual(result["sandbox"], "disposable repository copy")
+
+    @patch("harness._run_bounded_process")
+    def test_run_tests_uses_configured_container_interpreter(self, run):
+        python = self.root / "container-python"
+        python.touch()
+        run.return_value = {
+            "exit_code": 0,
+            "output": "ok",
+            "truncated": False,
+            "timed_out": False,
+        }
+
+        with patch.dict(
+            "harness.os.environ", {"HARNESS_PYTHON": str(python)}, clear=False
+        ):
+            harness.run_tests({})
+
+        self.assertEqual(run.call_args.args[0][0], str(python))
 
     @patch("harness._run_bounded_process")
     def test_run_tests_reports_timeouts_as_bounded_results(self, run):
@@ -650,7 +670,7 @@ class ContextEngineeringTests(unittest.TestCase):
         self.assertIn("old", messages[1]["content"])
 
     def test_session_store_round_trips_and_rejects_other_repositories(self):
-        store = harness.SessionStore(Path("state/session.json"), self.root)
+        store = harness.SessionStore(Path("state/harness.db"), self.root)
         messages = [
             {"role": "system", "content": "rules"},
             {"role": "user", "content": "continue"},
@@ -662,22 +682,133 @@ class ContextEngineeringTests(unittest.TestCase):
         self.assertEqual(session_id, "session-7")
         self.assertEqual(loaded, messages)
         self.assertEqual(store.path.stat().st_mode & 0o777, 0o600)
-        payload = json.loads(store.path.read_text(encoding="utf-8"))
-        payload["repository_root"] = str(self.root / "other")
-        store.path.write_text(json.dumps(payload), encoding="utf-8")
+        other_store = harness.SessionStore(store.path, self.root / "other")
         with self.assertRaisesRegex(RuntimeError, "different repository"):
-            store.load()
+            other_store.save("session-7", messages)
+
+        with sqlite3.connect(store.path) as connection:
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+        self.assertTrue(
+            {
+                "sessions",
+                "context_snapshots",
+                "messages",
+                "events",
+                "checkpoints",
+                "artifacts",
+            }
+            <= tables
+        )
+        self.assertEqual(journal_mode, "wal")
+
+    def test_large_event_payloads_use_content_addressed_artifacts(self):
+        store = harness.SessionStore(Path("state/harness.db"), self.root)
+        logger = harness.EventLogger(store, "session-1")
+        large_result = "x" * (harness.MAX_EVENT_PAYLOAD_CHARS + 1)
+
+        logger.log("tool_call_completed", result=large_result)
+
+        with sqlite3.connect(store.path) as connection:
+            payload_json, artifact_id = connection.execute(
+                "SELECT payload_json, artifact_id FROM events"
+            ).fetchone()
+            artifact_path = connection.execute(
+                "SELECT path FROM artifacts WHERE id = ?", (artifact_id,)
+            ).fetchone()[0]
+        self.assertLess(len(payload_json), 1_000)
+        self.assertEqual(len(artifact_id), 64)
+        self.assertTrue((self.root / artifact_path).is_file())
+        self.assertEqual(store.events("session-1")[0]["result"], large_result)
+        self.assertEqual(harness.list_files({"path": "state"})["files"], [])
+
+    def test_session_store_keeps_immutable_context_snapshots(self):
+        store = harness.SessionStore(Path("state/harness.db"), self.root)
+        first = [{"role": "system", "content": "rules"}]
+        second = [*first, {"role": "user", "content": "new question"}]
+
+        store.save("session-1", first, reason="initial")
+        store.save("session-1", second, reason="user_turn")
+
+        with sqlite3.connect(store.path) as connection:
+            snapshots = connection.execute(
+                """
+                SELECT reason, COUNT(messages.id)
+                FROM context_snapshots
+                JOIN messages ON messages.snapshot_id = context_snapshots.id
+                GROUP BY context_snapshots.id
+                ORDER BY context_snapshots.id
+                """
+            ).fetchall()
+        self.assertEqual(snapshots, [("initial", 1), ("user_turn", 2)])
+        self.assertEqual(store.load(), ("session-1", second))
+
+    def test_imports_legacy_session_and_progress_into_sqlite(self):
+        legacy_messages = [
+            {"role": "system", "content": "old rules"},
+            {"role": "user", "content": "continue"},
+        ]
+        session_path = self.write_text(
+            ".harness/session.json",
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "session_id": "legacy-session",
+                    "repository_root": str(self.root),
+                    "messages": legacy_messages,
+                }
+            ),
+        )
+        progress_path = self.write_text(
+            ".harness/progress.md",
+            """# Harness progress
+
+- Status: interrupted
+
+## Current objective
+
+Finish the migration
+
+## Recent actions
+
+- Tool `read_file` completed.
+""",
+        )
+        store = harness.SessionStore(Path(".harness/harness.db"), self.root)
+
+        imported = store.import_legacy_session(session_path)
+        tracker = harness.ProgressTracker(
+            store, "legacy-session", load_existing=False
+        )
+
+        self.assertEqual(imported, ("legacy-session", legacy_messages))
+        self.assertTrue(tracker.import_legacy(progress_path))
+        self.assertIn("Finish the migration", tracker.render())
+        self.assertTrue(session_path.exists())
+        self.assertTrue(progress_path.exists())
 
     def test_runtime_state_refuses_to_overwrite_unrelated_files(self):
         self.write_text("source.json", '{"application": true}')
         self.write_text("notes.md", "# Project notes\n")
+        unrelated_database = self.root / "application.db"
+        with sqlite3.connect(unrelated_database) as connection:
+            connection.execute("CREATE TABLE application_data (value TEXT)")
 
-        store = harness.SessionStore(Path("source.json"), self.root)
+        with self.assertRaisesRegex(RuntimeError, "state database"):
+            harness.SessionStore(Path("source.json"), self.root)
+        with self.assertRaisesRegex(RuntimeError, "unrelated SQLite"):
+            harness.SessionStore(Path("application.db"), self.root)
 
-        with self.assertRaisesRegex(RuntimeError, "non-session"):
-            store.ensure_safe_to_replace()
+        store = harness.SessionStore(Path("state/harness.db"), self.root)
+        store.save("session-1", [{"role": "system", "content": "rules"}])
+        tracker = harness.ProgressTracker(store, "session-1", load_existing=False)
         with self.assertRaisesRegex(ValueError, "non-progress"):
-            harness.ProgressTracker(Path("notes.md"), "session-1")
+            tracker.import_legacy(Path("notes.md"))
         self.assertEqual(
             (self.root / "source.json").read_text(), '{"application": true}'
         )
@@ -686,24 +817,24 @@ class ContextEngineeringTests(unittest.TestCase):
         )
 
     def test_progress_tracker_preserves_objective_across_instances(self):
-        tracker = harness.ProgressTracker(Path("state/progress.md"), "session-1")
+        store = harness.SessionStore(Path("state/harness.db"), self.root)
+        store.save("session-1", [{"role": "system", "content": "rules"}])
+        tracker = harness.ProgressTracker(store, "session-1")
         tracker.start("Migrate the session persistence layer")
         tracker.record_tool("read_file", True)
 
-        resumed = harness.ProgressTracker(Path("state/progress.md"), "session-1")
+        resumed = harness.ProgressTracker(store, "session-1")
         resumed.complete("Migration still needs verification")
-        content = resumed.path.read_text(encoding="utf-8")
+        content = resumed.render()
 
         self.assertIn("Migrate the session persistence layer", content)
         self.assertIn("Tool `read_file` completed", content)
         self.assertIn("Migration still needs verification", content)
 
     def test_run_turn_persists_summarized_context_and_progress(self):
-        logger = harness.JsonlEventLogger(self.root / "events.jsonl", "session-9")
-        store = harness.SessionStore(Path("state/session.json"), self.root)
-        progress = harness.ProgressTracker(
-            Path("state/progress.md"), "session-9", load_existing=False
-        )
+        store = harness.SessionStore(Path("state/harness.db"), self.root)
+        logger = harness.EventLogger(store, "session-9")
+        progress = harness.ProgressTracker(store, "session-9", load_existing=False)
         large_text = "x" * 10_000
         client = Mock()
         client.chat.completions.create.side_effect = [
@@ -719,6 +850,7 @@ class ContextEngineeringTests(unittest.TestCase):
             make_response(content="Done"),
         ]
         messages = [{"role": "system", "content": "rules"}]
+        store.save("session-9", messages, reason="test_setup")
 
         with redirect_stdout(io.StringIO()):
             harness.run_turn(
@@ -737,7 +869,7 @@ class ContextEngineeringTests(unittest.TestCase):
             len(messages[3]["content"]), harness.MAX_CONTEXT_TOOL_OUTPUT_CHARS
         )
         self.assertEqual(store.load(), ("session-9", messages))
-        self.assertIn("Turn completed: Done", progress.path.read_text())
+        self.assertIn("Turn completed: Done", progress.render())
 
     def test_main_resumes_session_identity_and_conversation(self):
         session_path = self.root / "session.json"
@@ -833,12 +965,16 @@ class RunTurnTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
-        self.log_path = Path(self.temp_dir.name) / "events.jsonl"
-        self.logger = harness.JsonlEventLogger(self.log_path, "session-1")
+        self.root = Path(self.temp_dir.name).resolve()
+        self.root_patch = patch("harness._repository_root", return_value=self.root)
+        self.root_patch.start()
+        self.addCleanup(self.root_patch.stop)
+        self.store = harness.SessionStore(Path("state/harness.db"), self.root)
+        self.logger = harness.EventLogger(self.store, "session-1")
         self.args = make_args()
 
     def read_events(self):
-        return [json.loads(line) for line in self.log_path.read_text().splitlines()]
+        return self.store.events("session-1")
 
     def test_calls_api_with_tools_and_keeps_history(self):
         client = Mock()
@@ -1013,8 +1149,12 @@ class InteractiveCliTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
-        path = Path(self.temp_dir.name) / "events.jsonl"
-        self.logger = harness.JsonlEventLogger(path, "session-1")
+        self.root = Path(self.temp_dir.name).resolve()
+        self.root_patch = patch("harness._repository_root", return_value=self.root)
+        self.root_patch.start()
+        self.addCleanup(self.root_patch.stop)
+        self.store = harness.SessionStore(Path("state/harness.db"), self.root)
+        self.logger = harness.EventLogger(self.store, "session-1")
         self.args = make_args()
         self.messages = [{"role": "system", "content": "test"}]
 
@@ -1069,10 +1209,7 @@ class InteractiveCliTests(unittest.TestCase):
         self.assertIn("2 messages removed", stdout.getvalue())
         client.chat.completions.create.assert_not_called()
 
-        events = [
-            json.loads(line)
-            for line in self.logger.path.read_text(encoding="utf-8").splitlines()
-        ]
+        events = self.store.events("session-1")
         self.assertEqual(events[-1]["event"], "conversation_context_cleared")
         self.assertEqual(events[-1]["removed_message_count"], 2)
         self.assertEqual(events[-1]["history_message_count"], 1)
