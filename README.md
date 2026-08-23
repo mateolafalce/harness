@@ -12,7 +12,7 @@ Core loop:
 5. Validate tools; request approval for side effects.
 6. Summarize large outputs.
 7. Compact old complete turns near context limit.
-8. Save session and progress checkpoints.
+8. Commit session, event, and progress checkpoints to SQLite.
 9. Continue until final response or guardrail stop.
 
 ## Context
@@ -33,17 +33,25 @@ Default: eight path hints, no eager file-body loading. Tune with
 `search_text`, and `read_file`.
 
 Tool payloads over 4,000 characters become valid JSON head/tail summaries in
-model history. Full results remain in JSONL logs. Model can rerun narrower query
-when omitted middle matters.
+model history. Full results remain in the audit store. Model can rerun a
+narrower query when omitted middle matters.
 
 History compacts above `--compaction-threshold` (`0.70` default). Complete old
 turns become bounded working summary. Latest two turns stay verbatim; tune with
 `--keep-recent-turns`. Interactive `/compact` triggers manual compaction.
 
-## Sessions and progress
+## Storage, sessions, and progress
 
-Session state saves atomically to `.harness/session.json`, mode `0600`. Contains
-schema version, repository identity, session ID, and model messages.
+SQLite is the source of truth at `.harness/harness.db`, mode `0600`. It uses WAL,
+foreign keys, a five-second busy timeout, and an application marker that prevents
+accidental use of unrelated databases. Configure it with `--state-file`; the old
+`--session-file` spelling remains an alias.
+
+The database stores sessions, immutable context snapshots, normalized messages,
+append-only events, progress checkpoints, and artifact metadata. Updating active
+context creates a complete snapshot in one transaction. Compaction, `/clear`,
+and failed-turn rollback therefore change the resumable view without deleting
+older snapshots.
 
 Resume:
 
@@ -51,15 +59,19 @@ Resume:
 .venv/bin/python harness.py --resume
 ```
 
-Use `--session-file PATH` for another repository-relative file. Resume reloads
+Use `--state-file PATH` for another repository-relative database. Resume reloads
 current `AGENTS.md`; stored system instructions never override new policy.
-Malformed state, cross-repository state, and unrelated existing files are
-rejected. Session files and JSONL logs stay hidden from model-facing repository
-tools.
+Malformed state, cross-repository session IDs, newer schemas, and unrelated
+SQLite files are rejected. The database, WAL/SHM sidecars, artifacts, and
+optional JSONL export stay hidden from model-facing repository tools.
 
-Long tasks write `.harness/progress.md`: objective, status, recent tool outcomes,
-completion, interruption. Resume injects notes as fallible memory; model must
-verify against source. Configure with `--progress-file`.
+Long tasks checkpoint their objective, status, and latest 20 actions in SQLite.
+Resume injects the latest checkpoint as fallible memory; the model must verify it
+against source.
+
+On the first `--resume` with an empty database, the harness imports the previous
+`.harness/session.json` and `.harness/progress.md` formats. Source files are left
+untouched. `--progress-file` selects a different legacy progress file.
 
 ## Editing and approvals
 
@@ -75,7 +87,8 @@ partial edits.
 - `allow`: execute valid gated calls without prompt. Trusted workflows only.
 - `deny`: reject all gated calls.
 
-Validation runs before approval. Decision returns to model and JSONL log.
+Validation runs before approval. The decision returns to the model and audit
+store.
 
 ## Shell sandbox
 
@@ -96,9 +109,10 @@ and outside-project paths. Disables Git hooks, filesystem monitors, external
 diff programs, and text conversion.
 
 Commands run in disposable repository copy. Copy omits generated caches,
-`.venv`, local `.env` files, and default event log. Child environment keeps only
-basic locale, terminal, temporary-directory, and executable-path values. API
-keys and proxy variables stay out. Shell filesystem changes never persist.
+`.venv`, local `.env` files, runtime state, and event exports. Child environment
+keeps only basic locale, terminal, temporary-directory, and executable-path
+values. API keys and proxy variables stay out. Shell filesystem changes never
+persist.
 
 Disposable copy limits repository damage. It is not OS isolation: approved code
 can still read host data or use network. Use container or VM for untrusted
@@ -123,9 +137,14 @@ expired loops roll incomplete messages back.
 
 ## Observability
 
-JSONL events cover session config, selected paths, compactions, API calls, tool
-calls, approvals, errors, latency, tokens, and termination. Logs store prompts,
-responses, and tool arguments in full. Sensitive. Never commit them.
+Append-only SQLite events cover session config, selected paths, compactions, API
+calls, tool calls, approvals, errors, latency, tokens, and termination. Event
+payloads over 32,000 characters move to content-addressed JSON artifacts under
+`.harness/harness.db.artifacts`; the event retains their hash and size. Prompts,
+responses, tool arguments, and results are sensitive. Never commit `.harness`.
+
+`--log-file PATH` optionally exports the same events to JSONL for external tools.
+SQLite remains authoritative.
 
 ## Install
 
@@ -138,6 +157,34 @@ cp .env.example .env
 
 Create key in [Cerebras console](https://cloud.cerebras.ai/). Exported
 `CEREBRAS_API_KEY` wins over `.env`.
+
+## Docker Compose
+
+Compose builds a Python 3.12 image with Git, ripgrep, and bounded application
+dependencies. It runs as a non-root user, bind-mounts the repository at
+`/workspace`, reads `.env`, and persists `.harness` on the host. The container
+drops Linux capabilities, prevents privilege escalation, uses a read-only root
+filesystem, and provides a bounded temporary filesystem.
+
+```bash
+docker compose build
+docker compose run --rm harness
+docker compose run --rm harness --resume
+docker compose run --rm harness --approval-policy deny "Review this repository."
+```
+
+The default container UID/GID is `1000`. Override it when the host user differs:
+
+```bash
+HOST_UID=$(id -u) HOST_GID=$(id -g) docker compose build
+```
+
+Run the test suite inside the image:
+
+```bash
+docker compose run --rm --entrypoint python harness \
+  -m unittest discover -s tests -v
+```
 
 ## Use
 
@@ -161,7 +208,6 @@ Trusted edit session:
   --approval-policy ask \
   --max-turns 5 \
   --timeout 20 \
-  --log-file logs/session.jsonl \
   "Fix the failing test and verify it."
 ```
 
