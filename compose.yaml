@@ -1,0 +1,24 @@
+services:
+  harness:
+    build:
+      context: .
+      args:
+        USER_ID: "${HOST_UID:-1000}"
+        GROUP_ID: "${HOST_GID:-1000}"
+    env_file:
+      - .env
+    init: true
+    stdin_open: true
+    tty: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=512m
+    working_dir: /workspace
+    volumes:
+      - type: bind
+        source: .
+        target: /workspace
