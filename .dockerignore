@@ -1,0 +1,11 @@
+.git
+.gitignore
+.env
+.harness
+.venv
+__pycache__
+*.py[cod]
+*.jsonl
+.pytest_cache
+.mypy_cache
+.ruff_cache
