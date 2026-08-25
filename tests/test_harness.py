@@ -945,6 +945,7 @@ class PrintResponseTests(unittest.TestCase):
             "completion_tokens": 5,
             "total_tokens": 15,
             "latency_ms": 25.0,
+            "context_window_tokens": 1_000,
             "context_used_percent": 1.5,
         }
 
@@ -959,6 +960,7 @@ class PrintResponseTests(unittest.TestCase):
         self.assertNotIn("**bold**", output)
         self.assertIn("metrics>", output)
         self.assertIn("cached=4 tokens", output)
+        self.assertIn("context=1.5% of 1.000 tokens", output)
 
 
 class RunTurnTests(unittest.TestCase):

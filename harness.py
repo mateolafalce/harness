@@ -1410,6 +1410,10 @@ def format_metric(value: Any, suffix: str = "") -> str:
     return "n/a" if value is None else f"{value}{suffix}"
 
 
+def format_token_count(value: Any) -> str:
+    return "n/a" if value is None else f"{value:,}".replace(",", ".")
+
+
 def print_response(content: str, metrics: dict[str, Any]) -> None:
     """Render the Markdown answer and its request metrics."""
     console = Console()
@@ -1423,7 +1427,8 @@ def print_response(content: str, metrics: dict[str, Any]) -> None:
         f"completion={format_metric(metrics['completion_tokens'])} tokens | "
         f"total={format_metric(metrics['total_tokens'])} tokens | "
         f"latency={format_metric(metrics['latency_ms'], ' ms')} | "
-        f"context={format_metric(metrics['context_used_percent'], '%')}",
+        f"context={format_metric(metrics['context_used_percent'], '%')} of "
+        f"{format_token_count(metrics['context_window_tokens'])} tokens",
         style="dim",
     )
 
