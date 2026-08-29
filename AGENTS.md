@@ -2,7 +2,16 @@
 
 ## Project Structure & Module Organization
 
-`harness.py` contains the complete command-line application: argument parsing, the Cerebras agent loop, tool implementations, JSONL logging, and interactive-mode handling. Tests live in `tests/test_harness.py` and mirror those responsibilities with `unittest` classes. Runtime dependencies are pinned by compatible ranges in `requirements.txt`. Use `.env.example` as the configuration template; local `.env` files, generated `events.jsonl` logs, caches, and `.venv/` are development artifacts and must not be committed.
+The `harness/` package is the application. `harness.py` is a thin CLI launcher (`python harness.py` or `python -m harness`).
+
+- `harness/cli.py` — argument parsing, interactive mode, and `main`
+- `harness/agent/` — turn loop, instruction/context assembly, compaction
+- `harness/tools/` — tool registry, handlers, sandbox, and patch application
+- `harness/persistence/` — SQLite session store, event log, progress checkpoints
+- `harness/workspace.py` — repository boundary and private runtime paths
+- `harness/config.py` — constants and typed `AgentSettings`
+
+Tests live in `tests/test_harness.py`. Runtime dependencies are pinned by compatible ranges in `requirements.txt`. Use `.env.example` as the configuration template; local `.env` files, generated `events.jsonl` logs, caches, and `.venv/` are development artifacts and must not be committed.
 
 ## Build, Test, and Development Commands
 
@@ -13,6 +22,7 @@ python -m venv .venv                    # Create it if absent
 .venv/bin/pip install -r requirements.txt
 .venv/bin/python harness.py --help      # Inspect CLI options
 .venv/bin/python harness.py             # Start interactive mode
+.venv/bin/python -m harness --help      # Equivalent package entry point
 .venv/bin/python -m unittest discover -s tests -v
 ```
 

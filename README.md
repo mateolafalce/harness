@@ -7,4 +7,5 @@ repository. Manages limited model context. No agent framework.
 
 ```bash
 .venv/bin/python harness.py
+# or: .venv/bin/python -m harness
 ```
