@@ -226,6 +226,12 @@ class _TranscriptStream:
             return self.lines + [self._partial]
         return self.lines
 
+    def clear(self) -> None:
+        self.lines.clear()
+        self._partial = ""
+        self.offset = 0
+        self._bol = True
+
     def _pad_outgoing(self, data: str) -> str:
         """Inset live transcript writes by one column on the left."""
         if _H_MARGIN <= 0:
@@ -327,6 +333,23 @@ def _scroll_transcript(delta: int, reveal_cursor: bool = True) -> None:
     max_offset = max(0, len(_TRANSCRIPT.rows()) - viewport)
     _TRANSCRIPT.offset = min(max_offset, max(0, _TRANSCRIPT.offset + delta))
     _redraw_transcript(_TRANSCRIPT, reveal_cursor=reveal_cursor)
+
+
+def clear_transcript() -> None:
+    """Wipe the TUI conversation view so the next output starts at the top."""
+    global _RECORD_TRANSCRIPT
+    target = _TRANSCRIPT
+    if target is None:
+        return
+    target.clear()
+    _redraw_transcript(target, reveal_cursor=False)
+    previous = _RECORD_TRANSCRIPT
+    _RECORD_TRANSCRIPT = False
+    try:
+        target._stream.write(f"{_SGR_WHITE_ON_BLACK}\033[1;1H")
+        target._stream.flush()
+    finally:
+        _RECORD_TRANSCRIPT = previous
 
 
 @contextmanager

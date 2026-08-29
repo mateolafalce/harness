@@ -39,7 +39,7 @@ Resume the latest session from `.harness/harness.db`:
 .venv/bin/python harness.py --resume
 ```
 
-Interactive commands: `/help`, `/clear`, `/compact`, `/exit`, `/quit`.
+Interactive commands: `/help`, `/clear` (history and screen), `/compact`, `/exit`, `/quit`.
 Ctrl-D also quits. Scroll the transcript with the mouse wheel or Page Up
 and Page Down. All flags: `.venv/bin/python harness.py --help`.
 

@@ -1543,6 +1543,29 @@ class TranscriptScrollTests(unittest.TestCase):
         self.assertEqual(real.getvalue(), f"{gutter}hello\n")
         self.assertEqual(transcript.rows(), ["hello"])
 
+    def test_clear_transcript_wipes_rows_and_homes_the_cursor(self):
+        from harness import display
+
+        real = io.StringIO()
+        transcript = display._TranscriptStream(real)
+        display._TRANSCRIPT = transcript
+        display._SCREEN_SIZE = (20, 10)
+        display._RECORD_TRANSCRIPT = True
+        transcript.write("hello\n")
+        transcript.write("world\n")
+        real.seek(0)
+        real.truncate(0)
+
+        display.clear_transcript()
+
+        self.assertEqual(transcript.rows(), [])
+        self.assertEqual(transcript.offset, 0)
+        output = real.getvalue()
+        self.assertIn("\033[K", output)
+        self.assertTrue(output.endswith(f"{display._SGR_WHITE_ON_BLACK}\033[1;1H"))
+        transcript.write("fresh\n")
+        self.assertEqual(transcript.rows(), ["fresh"])
+
     def test_cannot_scroll_past_the_oldest_row(self):
         from harness import display
 
@@ -1836,10 +1859,11 @@ class InteractiveCliTests(WorkspaceTestCase):
         self.assertIn("/clear", stdout.getvalue())
         client.chat.completions.create.assert_not_called()
 
+    @patch("harness.cli.clear_transcript")
     @patch("harness.cli.sys.stdin.isatty", return_value=True)
     @patch("builtins.input", side_effect=["/clear", "/exit"])
     def test_clear_removes_conversation_but_keeps_system_prompt(
-        self, _input, _isatty
+        self, _input, _isatty, clear_tui
     ):
         client = Mock()
         self.messages.extend(
@@ -1858,6 +1882,8 @@ class InteractiveCliTests(WorkspaceTestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(self.messages, [{"role": "system", "content": "test"}])
         self.assertIn("2 messages removed", stdout.getvalue())
+        self.assertNotIn("> /clear", strip_ansi(stdout.getvalue()))
+        clear_tui.assert_called_once()
         client.chat.completions.create.assert_not_called()
 
         events = self.store.events("session-1")
