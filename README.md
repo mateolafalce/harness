@@ -5,8 +5,8 @@ repository. Manages limited model context. No agent framework.
 
 On a TTY, interactive mode occupies the whole terminal: black background,
 boxed `>` prompt with the model on the right, and token metrics under the
-box. Typed messages appear as `you>`; replies as `assistant>`. One-shot
-prompts skip the fullscreen UI.
+box. Typed messages appear as a `>` bar with the time on the right; replies
+as `assistant>`. One-shot prompts skip the fullscreen UI.
 
 ## Setup
 
