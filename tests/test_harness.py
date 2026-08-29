@@ -6,6 +6,7 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -30,6 +31,20 @@ class WorkspaceTestCase(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
         return path
+
+
+def strip_ansi(data: str) -> str:
+    from harness.display import _take_ansi
+
+    chars: list[str] = []
+    index = 0
+    while index < len(data):
+        if data[index] == "\x1b":
+            _seq, index = _take_ansi(data, index)
+            continue
+        chars.append(data[index])
+        index += 1
+    return "".join(chars)
 
 
 def make_args(**overrides):
@@ -990,12 +1005,99 @@ class PrintResponseTests(unittest.TestCase):
 
     def test_renders_submitted_user_input_in_the_transcript(self):
         stdout = io.StringIO()
+        now = datetime(2026, 8, 29, 19, 42)
 
         with redirect_stdout(stdout):
-            harness.print_user_input("cuéntame un chiste")
+            harness.print_user_input("cuéntame un chiste", now=now)
 
         output = stdout.getvalue()
-        self.assertIn("you> cuéntame un chiste", output)
+        plain = strip_ansi(output)
+        self.assertIn("> cuéntame un chiste", plain)
+        self.assertIn("7:42 PM", plain)
+        self.assertNotIn("you>", plain)
+        self.assertIn("\033[48;2;45;51;64m", output)
+        self.assertIn("\033[48;5;238m", output)
+
+    def test_user_input_bar_right_aligns_the_clock(self):
+        from harness.display import _format_user_input_lines
+
+        row = _format_user_input_lines(
+            "elimina la metrica de latencia", 72, "7:42 PM"
+        )[0]
+        self.assertEqual(len(row), 72)
+        self.assertTrue(row.startswith(" > elimina la metrica de latencia"))
+        self.assertTrue(row.endswith("7:42 PM "))
+
+    def test_user_input_bar_wraps_and_keeps_the_clock_on_the_first_line(self):
+        from harness.display import _format_user_input_lines
+
+        content = "one two three four five six seven eight nine ten"
+        lines = _format_user_input_lines(content, 36, "7:42 PM")
+        self.assertGreater(len(lines), 1)
+        self.assertEqual(len(lines[0]), 36)
+        self.assertTrue(lines[0].startswith(" > "))
+        self.assertTrue(lines[0].endswith("7:42 PM "))
+        self.assertTrue(lines[1].startswith("   "))
+        self.assertNotIn("7:42 PM", lines[1])
+
+    def test_user_input_bar_uses_a_slate_background(self):
+        from harness.display import _paint_user_input_line
+
+        painted = _paint_user_input_line(
+            " > elimina la metrica de latencia          7:42 PM ",
+            "7:42 PM",
+        )
+        plain = strip_ansi(painted)
+        self.assertIn("\033[48;2;45;51;64m", painted)
+        self.assertIn("\033[48;5;238m", painted)
+        self.assertIn("> elimina la metrica de latencia", plain)
+        self.assertIn("7:42 PM", plain)
+        self.assertTrue(painted.endswith("\033[0m"))
+
+    def test_user_input_bar_has_one_row_of_padding(self):
+        stdout = io.StringIO()
+        now = datetime(2026, 8, 29, 19, 42)
+        size = os.terminal_size((80, 24))
+
+        with patch("harness.display.shutil.get_terminal_size", return_value=size):
+            with redirect_stdout(stdout):
+                harness.print_user_input("hello", now=now)
+
+        output = stdout.getvalue()
+        plain_lines = strip_ansi(output).splitlines()
+        text_index = next(
+            index for index, line in enumerate(plain_lines) if "> hello" in line
+        )
+        above = plain_lines[text_index - 1]
+        below = plain_lines[text_index + 1]
+        self.assertFalse(above.strip())
+        self.assertFalse(below.strip())
+        self.assertEqual(len(above), len(plain_lines[text_index]))
+        self.assertEqual(len(below), len(plain_lines[text_index]))
+        self.assertGreaterEqual(output.count("\033[48;2;45;51;64m"), 3)
+
+    def test_user_input_bar_keeps_a_black_left_gutter(self):
+        from harness.display import (
+            _H_MARGIN,
+            _SGR_WHITE_ON_BLACK,
+            _TranscriptStream,
+            _paint_user_bar_fill,
+            _paint_user_input_line,
+        )
+
+        def padded(payload: str) -> str:
+            return _TranscriptStream(io.StringIO())._pad_outgoing(payload)
+
+        fill = padded(_paint_user_bar_fill(20))
+        row = padded(
+            _paint_user_input_line(" > hello                    7:42 PM ", "7:42 PM")
+        )
+        gutter = f"{_SGR_WHITE_ON_BLACK}{' ' * _H_MARGIN}"
+        slate = "\033[48;2;45;51;64m"
+        for painted in (fill, row):
+            self.assertTrue(painted.startswith(gutter))
+            self.assertLess(painted.index(gutter), painted.index(slate))
+            self.assertEqual(painted.count(gutter), 1)
 
 
 class PromptChromeTests(unittest.TestCase):
@@ -1046,6 +1148,81 @@ class PromptChromeTests(unittest.TestCase):
         self.assertIn("prompt=10 tokens", output)
         self.assertIn("cached=4 tokens", output)
         self.assertIn("context=1.5% of 1.000 tokens", output)
+        self.assertNotIn("latency=", output)
+        token_lines = [
+            line for line in output.splitlines() if "prompt=10 tokens" in line
+        ]
+        self.assertEqual(len(token_lines), 1)
+
+    def test_status_stays_on_one_line_when_the_terminal_is_wide_enough(self):
+        from harness.display import _status_lines
+
+        metrics = {
+            "prompt_tokens": 1579,
+            "cached_tokens": 0,
+            "completion_tokens": 452,
+            "total_tokens": 2031,
+            "latency_ms": 827.03,
+            "context_window_tokens": 131_072,
+            "context_used_percent": 1.5495,
+        }
+        combined = harness.format_metrics_line(metrics)
+        lines = _status_lines(metrics, len(combined))
+        self.assertEqual(lines, (combined,))
+        self.assertIn("prompt=1579 tokens", lines[0])
+        self.assertIn("context=1.5495% of 131.072 tokens", lines[0])
+        self.assertNotIn("latency=", lines[0])
+
+    def test_status_wraps_only_when_the_terminal_is_too_narrow(self):
+        from harness.display import _status_lines
+
+        metrics = {
+            "prompt_tokens": 1579,
+            "cached_tokens": 0,
+            "completion_tokens": 452,
+            "total_tokens": 2031,
+            "latency_ms": 827.03,
+            "context_window_tokens": 131_072,
+            "context_used_percent": 1.5495,
+        }
+        combined = harness.format_metrics_line(metrics)
+        lines = _status_lines(metrics, len(combined) - 1)
+        self.assertEqual(len(lines), 2)
+        self.assertIn("prompt=1579 tokens", lines[0])
+        self.assertNotIn("context=", lines[0])
+        self.assertIn("context=1.5495%", lines[1])
+        self.assertNotIn("latency=", lines[0])
+        self.assertNotIn("latency=", lines[1])
+
+    def test_fallback_prompt_keeps_metrics_on_one_line_when_wide(self):
+        stdout = io.StringIO()
+        metrics = {
+            "prompt_tokens": 1579,
+            "cached_tokens": 0,
+            "completion_tokens": 452,
+            "total_tokens": 2031,
+            "latency_ms": 827.03,
+            "context_window_tokens": 131_072,
+            "context_used_percent": 1.5495,
+        }
+        size = os.terminal_size((160, 24))
+
+        with patch("harness.display.shutil.get_terminal_size", return_value=size):
+            with patch("builtins.input", return_value="hello"):
+                with redirect_stdout(stdout):
+                    text = harness.read_prompt(
+                        "gpt-oss-120b", "medium", metrics
+                    )
+
+        self.assertEqual(text, "hello")
+        token_lines = [
+            line
+            for line in stdout.getvalue().splitlines()
+            if "prompt=1579 tokens" in line
+        ]
+        self.assertEqual(len(token_lines), 1)
+        self.assertIn("context=1.5495% of 131.072 tokens", token_lines[0])
+        self.assertNotIn("latency=", stdout.getvalue())
 
 
 class _TtyBuffer(io.StringIO):
@@ -1362,8 +1539,32 @@ class TranscriptScrollTests(unittest.TestCase):
         display._RECORD_TRANSCRIPT = True
         transcript.write("hello\n")
 
-        self.assertEqual(real.getvalue(), " hello\n")
+        gutter = f"{display._SGR_WHITE_ON_BLACK} "
+        self.assertEqual(real.getvalue(), f"{gutter}hello\n")
         self.assertEqual(transcript.rows(), ["hello"])
+
+    def test_clear_transcript_wipes_rows_and_homes_the_cursor(self):
+        from harness import display
+
+        real = io.StringIO()
+        transcript = display._TranscriptStream(real)
+        display._TRANSCRIPT = transcript
+        display._SCREEN_SIZE = (20, 10)
+        display._RECORD_TRANSCRIPT = True
+        transcript.write("hello\n")
+        transcript.write("world\n")
+        real.seek(0)
+        real.truncate(0)
+
+        display.clear_transcript()
+
+        self.assertEqual(transcript.rows(), [])
+        self.assertEqual(transcript.offset, 0)
+        output = real.getvalue()
+        self.assertIn("\033[K", output)
+        self.assertTrue(output.endswith(f"{display._SGR_WHITE_ON_BLACK}\033[1;1H"))
+        transcript.write("fresh\n")
+        self.assertEqual(transcript.rows(), ["fresh"])
 
     def test_cannot_scroll_past_the_oldest_row(self):
         from harness import display
@@ -1636,7 +1837,11 @@ class InteractiveCliTests(WorkspaceTestCase):
             )
 
         self.assertEqual(exit_code, 0)
-        self.assertIn("you> cuéntame un chiste", stdout.getvalue())
+        output = stdout.getvalue()
+        plain = strip_ansi(output)
+        self.assertIn("> cuéntame un chiste", plain)
+        self.assertNotIn("you>", plain)
+        self.assertIn("\033[48;2;45;51;64m", output)
         run_turn.assert_called_once()
 
     @patch("harness.cli.sys.stdin.isatty", return_value=True)
@@ -1654,10 +1859,11 @@ class InteractiveCliTests(WorkspaceTestCase):
         self.assertIn("/clear", stdout.getvalue())
         client.chat.completions.create.assert_not_called()
 
+    @patch("harness.cli.clear_transcript")
     @patch("harness.cli.sys.stdin.isatty", return_value=True)
     @patch("builtins.input", side_effect=["/clear", "/exit"])
     def test_clear_removes_conversation_but_keeps_system_prompt(
-        self, _input, _isatty
+        self, _input, _isatty, clear_tui
     ):
         client = Mock()
         self.messages.extend(
@@ -1676,6 +1882,8 @@ class InteractiveCliTests(WorkspaceTestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(self.messages, [{"role": "system", "content": "test"}])
         self.assertIn("2 messages removed", stdout.getvalue())
+        self.assertNotIn("> /clear", strip_ansi(stdout.getvalue()))
+        clear_tui.assert_called_once()
         client.chat.completions.create.assert_not_called()
 
         events = self.store.events("session-1")

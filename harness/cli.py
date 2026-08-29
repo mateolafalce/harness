@@ -17,6 +17,7 @@ from harness.agent.compaction import compact_history
 from harness.agent.context import build_system_prompt, load_instruction_documents
 from harness.agent.loop import clear_conversation_context, report_turn_error, run_turn
 from harness.display import (
+    clear_transcript,
     empty_metrics,
     fullscreen_session,
     last_response_metrics,
@@ -227,19 +228,20 @@ def interactive_cli(
                 continue
             if prompt in {"/exit", "/quit"}:
                 return 0
-            print_user_input(prompt)
-            if prompt == "/help":
-                print(
-                    "Ask a question. Commands: /clear, /compact, /help, /exit, /quit"
-                )
-                continue
             if prompt == "/clear":
                 removed_count = clear_conversation_context(
                     messages, event_logger, session_store
                 )
+                clear_transcript()
                 print(
                     "Conversation context cleared "
                     f"({removed_count} message{'s' if removed_count != 1 else ''} removed)."
+                )
+                continue
+            print_user_input(prompt)
+            if prompt == "/help":
+                print(
+                    "Ask a question. Commands: /clear, /compact, /help, /exit, /quit"
                 )
                 continue
             if prompt == "/compact":

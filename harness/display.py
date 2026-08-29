@@ -9,6 +9,7 @@ import shutil
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime
 from typing import Any, TextIO
 
 from rich.console import Console
@@ -26,7 +27,9 @@ _BLACK_SCREEN = False
 _METRICS_BELOW_PROMPT = False
 _LAST_METRICS: dict[str, Any] | None = None
 _SCREEN_SIZE = (80, 24)
-_PROMPT_ROWS = 5
+_PROMPT_CHROME_ROWS = 3
+_DEFAULT_PROMPT_ROWS = 5
+_PROMPT_ROWS = _DEFAULT_PROMPT_ROWS
 _RECORD_TRANSCRIPT = True
 _TRANSCRIPT: _TranscriptStream | None = None
 _WHEEL_LINES = 3
@@ -36,6 +39,7 @@ _RAW_READ_CHUNK = 256
 _H_MARGIN = 1
 _INPUT_PREFIX = " > "
 _INPUT_RIGHT_PAD = " "
+_USER_BAR_V_PAD = 1
 
 _ENTER_ALT_SCREEN = "\033[?1049h"
 _LEAVE_ALT_SCREEN = "\033[?1049l"
@@ -47,6 +51,9 @@ _DISABLE_MOUSE = "\033[?1000l\033[?1006l"
 _SGR_RESET = "\033[0m"
 _SGR_WHITE_ON_BLACK = "\033[40;37m"
 _SGR_DIM = "\033[2m"
+_SGR_USER_BG = "\033[0m\033[48;5;238m\033[48;2;45;51;64m"
+_SGR_USER_FG = "\033[22;38;5;255m\033[38;2;232;234;237m"
+_SGR_USER_MUTED = "\033[22;38;5;246m\033[38;2;154;163;173m"
 _OSC_SET_BACKGROUND = "\033]11;#000000\007"
 _OSC_SET_FOREGROUND = "\033]10;#FFFFFF\007"
 _OSC_RESET_BACKGROUND = "\033]111\007"
@@ -98,11 +105,12 @@ def _prompt_origin() -> int:
 
 
 def _enter_fullscreen(stream: TextIO) -> None:
-    global _SCREEN_SIZE
+    global _SCREEN_SIZE, _PROMPT_ROWS
     size = shutil.get_terminal_size(fallback=(80, 24))
     width = max(size.columns, 1)
     height = max(size.lines, 1)
     _SCREEN_SIZE = (width, height)
+    _PROMPT_ROWS = _layout_prompt_rows(_content_width(), empty_metrics())
     stream.write(
         f"{_ENTER_ALT_SCREEN}{_OSC_SET_BACKGROUND}{_OSC_SET_FOREGROUND}"
         f"{_SGR_WHITE_ON_BLACK}{_ERASE_DISPLAY}{_CURSOR_HOME}"
@@ -117,11 +125,13 @@ def _enter_fullscreen(stream: TextIO) -> None:
 
 
 def _leave_fullscreen(stream: TextIO) -> None:
+    global _PROMPT_ROWS
     stream.write(
         f"{_SHOW_CURSOR}{_DISABLE_MOUSE}{_RESET_SCROLL_REGION}{_SGR_RESET}"
         f"{_OSC_RESET_BACKGROUND}{_OSC_RESET_FOREGROUND}{_LEAVE_ALT_SCREEN}"
     )
     stream.flush()
+    _PROMPT_ROWS = _DEFAULT_PROMPT_ROWS
 
 
 def _take_ansi(data: str, index: int) -> tuple[str, int]:
@@ -216,17 +226,28 @@ class _TranscriptStream:
             return self.lines + [self._partial]
         return self.lines
 
+    def clear(self) -> None:
+        self.lines.clear()
+        self._partial = ""
+        self.offset = 0
+        self._bol = True
+
     def _pad_outgoing(self, data: str) -> str:
         """Inset live transcript writes by one column on the left."""
         if _H_MARGIN <= 0:
             return data
-        pad = " " * _H_MARGIN
+        gutter = f"{_SGR_WHITE_ON_BLACK}{' ' * _H_MARGIN}"
         out: list[str] = []
         index = 0
         while index < len(data):
             char = data[index]
             if char == "\x1b":
                 seq, index = _take_ansi(data, index)
+                if self._bol:
+                    # Emit the black gutter before row SGR so the bar is not
+                    # flush with the terminal edge (matching the right margin).
+                    out.append(gutter)
+                    self._bol = False
                 out.append(seq)
                 continue
             index += 1
@@ -235,7 +256,7 @@ class _TranscriptStream:
                 self._bol = True
                 continue
             if self._bol and char >= " ":
-                out.append(pad)
+                out.append(gutter)
                 self._bol = False
             out.append(char)
         return "".join(out)
@@ -312,6 +333,23 @@ def _scroll_transcript(delta: int, reveal_cursor: bool = True) -> None:
     max_offset = max(0, len(_TRANSCRIPT.rows()) - viewport)
     _TRANSCRIPT.offset = min(max_offset, max(0, _TRANSCRIPT.offset + delta))
     _redraw_transcript(_TRANSCRIPT, reveal_cursor=reveal_cursor)
+
+
+def clear_transcript() -> None:
+    """Wipe the TUI conversation view so the next output starts at the top."""
+    global _RECORD_TRANSCRIPT
+    target = _TRANSCRIPT
+    if target is None:
+        return
+    target.clear()
+    _redraw_transcript(target, reveal_cursor=False)
+    previous = _RECORD_TRANSCRIPT
+    _RECORD_TRANSCRIPT = False
+    try:
+        target._stream.write(f"{_SGR_WHITE_ON_BLACK}\033[1;1H")
+        target._stream.flush()
+    finally:
+        _RECORD_TRANSCRIPT = previous
 
 
 @contextmanager
@@ -462,7 +500,7 @@ def empty_metrics(context_window: int | None = None) -> dict[str, Any]:
 
 
 def format_metrics_line(metrics: dict[str, Any] | None) -> str:
-    """Render token, latency, and context-window utilization as one line."""
+    """Render token and context-window utilization as one line."""
     data = empty_metrics()
     if metrics:
         data.update(metrics)
@@ -471,14 +509,13 @@ def format_metrics_line(metrics: dict[str, Any] | None) -> str:
         f"cached={format_metric(data['cached_tokens'])} tokens | "
         f"completion={format_metric(data['completion_tokens'])} tokens | "
         f"total={format_metric(data['total_tokens'])} tokens | "
-        f"latency={format_metric(data['latency_ms'], ' ms')} | "
         f"context={format_metric(data['context_used_percent'], '%')} of "
         f"{format_token_count(data['context_window_tokens'])} tokens"
     )
 
 
 def prompt_status_lines(metrics: dict[str, Any] | None) -> tuple[str, str]:
-    """Token and context stats shown under the boxed prompt."""
+    """Split token stats from context when the status line wraps."""
     data = empty_metrics()
     if metrics:
         data.update(metrics)
@@ -490,7 +527,6 @@ def prompt_status_lines(metrics: dict[str, Any] | None) -> tuple[str, str]:
             f"total={format_metric(data['total_tokens'])} tokens"
         ),
         (
-            f"latency={format_metric(data['latency_ms'], ' ms')} | "
             f"context={format_metric(data['context_used_percent'], '%')} of "
             f"{format_token_count(data['context_window_tokens'])} tokens"
         ),
@@ -503,12 +539,112 @@ def _output_console() -> Console:
     return Console()
 
 
-def print_user_input(content: str) -> None:
-    """Render a submitted user message in the conversation transcript."""
-    console = _output_console()
-    console.print()
-    console.print("you> ", style="bold green", end="")
-    console.print(content)
+def _format_clock(now: datetime | None = None) -> str:
+    """Local 12-hour clock, matching Grok's `7:42 PM` user-message stamp."""
+    moment = datetime.now() if now is None else now
+    hour = moment.hour % 12 or 12
+    meridian = "AM" if moment.hour < 12 else "PM"
+    return f"{hour}:{moment:%M} {meridian}"
+
+
+def _wrap_user_content(content: str, width: int) -> list[str]:
+    if width <= 0:
+        return [""]
+    text = " ".join(content.split())
+    if not text:
+        return [""]
+    lines: list[str] = []
+    remaining = text
+    while remaining:
+        if len(remaining) <= width:
+            lines.append(remaining)
+            break
+        cut = remaining.rfind(" ", 0, width)
+        if cut <= 0:
+            cut = width
+            lines.append(remaining[:cut])
+            remaining = remaining[cut:]
+        else:
+            lines.append(remaining[:cut])
+            remaining = remaining[cut + 1 :]
+    return lines
+
+
+def _format_user_input_lines(content: str, width: int, clock: str) -> tuple[str, ...]:
+    """Lay out a full-width user bar: `> text` on the left, clock on the right."""
+    prefix = _INPUT_PREFIX
+    right = _INPUT_RIGHT_PAD
+    stamp = clock
+    gap = 1
+    reserved = len(stamp) + gap + len(right) if stamp else len(right)
+    text_width = width - len(prefix) - reserved
+    if stamp and text_width < 8:
+        stamp = ""
+        reserved = len(right)
+        text_width = width - len(prefix) - reserved
+    text_width = max(text_width, 1)
+    chunks = _wrap_user_content(content, text_width)
+    lines: list[str] = []
+    for index, chunk in enumerate(chunks):
+        if index == 0 and stamp:
+            pad = width - len(prefix) - len(chunk) - len(stamp) - len(right)
+            lines.append(f"{prefix}{chunk}{' ' * max(pad, 0)}{stamp}{right}")
+        else:
+            lead = prefix if index == 0 else " " * len(prefix)
+            pad = width - len(lead) - len(chunk) - len(right)
+            lines.append(f"{lead}{chunk}{' ' * max(pad, 0)}{right}")
+    return tuple(lines)
+
+
+def _user_bar_reset() -> str:
+    return _SGR_WHITE_ON_BLACK if _BLACK_SCREEN else _SGR_RESET
+
+
+def _paint_user_bar_fill(width: int) -> str:
+    """Empty slate row used as vertical padding inside the user bar."""
+    return f"{_SGR_USER_BG}{' ' * max(width, 0)}{_user_bar_reset()}"
+
+
+def _paint_user_input_line(line: str, clock: str) -> str:
+    """Fill the user bar with a slate background distinct from the black screen."""
+    bg = _SGR_USER_BG
+    fg = f"{bg}{_SGR_USER_FG}"
+    muted = f"{bg}{_SGR_USER_MUTED}"
+    reset = _user_bar_reset()
+    prefix = _INPUT_PREFIX
+    indent = " " * len(prefix)
+    right = _INPUT_RIGHT_PAD
+    if line.startswith(prefix):
+        rest = line[len(prefix) :]
+        if clock and rest.endswith(right):
+            body = rest[: -len(right)]
+            if body.endswith(clock):
+                return (
+                    f"{muted}{prefix}{fg}{body[: -len(clock)]}"
+                    f"{muted}{clock}{bg}{right}{reset}"
+                )
+        return f"{muted}{prefix}{fg}{rest}{reset}"
+    if line.startswith(indent):
+        return f"{bg}{indent}{fg}{line[len(indent) :]}{reset}"
+    return f"{fg}{line}{reset}"
+
+
+def print_user_input(content: str, now: datetime | None = None) -> None:
+    """Render a submitted user message as a Grok-style bar with a clock."""
+    if _BLACK_SCREEN:
+        width = _content_width()
+    else:
+        columns = shutil.get_terminal_size(fallback=(80, 24)).columns
+        width = max(columns - 2 * _H_MARGIN, 1)
+    clock = _format_clock(now)
+    fill = _paint_user_bar_fill(width)
+    print()
+    for _ in range(_USER_BAR_V_PAD):
+        print(fill)
+    for index, line in enumerate(_format_user_input_lines(content, width, clock)):
+        print(_paint_user_input_line(line, clock if index == 0 else ""))
+    for _ in range(_USER_BAR_V_PAD):
+        print(fill)
 
 
 def print_response(content: str, metrics: dict[str, Any]) -> None:
@@ -603,9 +739,37 @@ def _input_row(text: str, label: str, width: int) -> str:
     )
 
 
-def _status_lines(metrics: dict[str, Any] | None, width: int) -> tuple[str, str]:
+def _status_lines(metrics: dict[str, Any] | None, width: int) -> tuple[str, ...]:
+    """Keep metrics on one row when they fit; wrap only if the terminal is narrow."""
+    combined = format_metrics_line(metrics)
+    if len(combined) <= width:
+        return (combined,)
     first, second = prompt_status_lines(metrics)
     return _fit(first, width), _fit(second, width)
+
+
+def _layout_prompt_rows(width: int, metrics: dict[str, Any] | None) -> int:
+    return _PROMPT_CHROME_ROWS + len(_status_lines(metrics, width))
+
+
+def _sync_prompt_layout(width: int, metrics: dict[str, Any] | None) -> None:
+    """Resize the pinned prompt when metrics fit on one line or wrap to two."""
+    global _PROMPT_ROWS
+    needed = _layout_prompt_rows(width, metrics)
+    if needed == _PROMPT_ROWS:
+        return
+    previous = _PROMPT_ROWS
+    _PROMPT_ROWS = needed
+    if not _BLACK_SCREEN:
+        return
+    height = _SCREEN_SIZE[1]
+    if height >= _PROMPT_ROWS + 2:
+        _emit_prompt(f"\033[1;{_scroll_region_height(height)}r")
+    if needed > previous:
+        _redraw_transcript(reveal_cursor=False)
+        return
+    for row in range(height - previous + 1, height - needed + 1):
+        _emit_prompt(f"\033[{row};1H\033[K")
 
 
 def _supports_live_prompt() -> bool:
@@ -978,6 +1142,7 @@ def _read_live_prompt(label: str, metrics: dict[str, Any]) -> str:
     global _RECORD_TRANSCRIPT
     height = _SCREEN_SIZE[1]
     box_width = max(_content_width(), 24)
+    _sync_prompt_layout(box_width, metrics)
     top_row = max(height - _PROMPT_ROWS + 1, 1)
     rows = tuple(top_row + index for index in range(_PROMPT_ROWS))
     fd = sys.stdin.fileno()

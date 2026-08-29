@@ -54,6 +54,7 @@ from harness.config import (
 )
 from harness.display import (
     _combined_metrics,
+    clear_transcript,
     empty_metrics,
     format_metrics_line,
     fullscreen_session,
@@ -134,6 +135,7 @@ __all__ = [
     "build_system_prompt",
     "calculator",
     "clear_conversation_context",
+    "clear_transcript",
     "compact_history",
     "current_workspace",
     "echo",
