@@ -10,6 +10,25 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import harness
+from harness.workspace import Workspace
+
+
+class WorkspaceTestCase(unittest.TestCase):
+    """Isolate repository tools against a temporary workspace."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.root = Path(self.temp_dir.name).resolve()
+        self.workspace = Workspace(self.root)
+        self.workspace.activate()
+        self.addCleanup(self.workspace.deactivate)
+
+    def write_text(self, relative_path, content):
+        path = self.root / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return path
 
 
 def make_args(**overrides):
@@ -176,21 +195,20 @@ class ToolTests(unittest.TestCase):
         self.assertFalse(unknown["ok"])
         self.assertIn("unknown tool", unknown["error"]["message"])
 
+    def test_execute_tool_does_not_swallow_agent_loop_errors(self):
+        def timeout_provider():
+            raise harness.AgentTimeoutError("agent loop timed out")
 
-class RepositoryToolTests(unittest.TestCase):
-    def setUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp_dir.cleanup)
-        self.root = Path(self.temp_dir.name).resolve()
-        self.root_patch = patch("harness._repository_root", return_value=self.root)
-        self.root_patch.start()
-        self.addCleanup(self.root_patch.stop)
+        with self.assertRaises(harness.AgentTimeoutError):
+            harness.execute_tool(
+                "git_diff",
+                '{"path": "."}',
+                timeout_seconds=1.0,
+                timeout_provider=timeout_provider,
+            )
 
-    def write_text(self, relative_path, content):
-        path = self.root / relative_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
-        return path
+
+class RepositoryToolTests(WorkspaceTestCase):
 
     def test_list_files_is_sorted_bounded_and_excludes_sensitive_paths(self):
         self.write_text("src/z.py", "z")
@@ -209,7 +227,7 @@ class RepositoryToolTests(unittest.TestCase):
         self.assertEqual(result["total_count"], 3)
 
     def test_list_files_reports_truncation(self):
-        with patch("harness.MAX_LISTED_FILES", 2):
+        with patch("harness.config.MAX_LISTED_FILES", 2):
             for name in ("c.py", "a.py", "b.py"):
                 self.write_text(name, name)
 
@@ -290,7 +308,7 @@ class RepositoryToolTests(unittest.TestCase):
         self.assertEqual(result["matches"][0]["path"], "source.py")
         self.assertEqual(result["skipped_files"], 2)
 
-    @patch("harness.subprocess.run")
+    @patch("harness.tools.process.subprocess.run")
     def test_git_diff_uses_a_non_shell_command_and_truncates_output(self, run):
         run.return_value = SimpleNamespace(
             returncode=0,
@@ -311,7 +329,7 @@ class RepositoryToolTests(unittest.TestCase):
             len(result["output"].splitlines()), harness.MAX_PROCESS_OUTPUT_LINES
         )
 
-    @patch("harness._run_bounded_process")
+    @patch("harness.tools.shell._run_bounded_process")
     def test_run_tests_uses_the_repository_virtual_environment(self, run):
         python = self.root / ".venv/bin/python"
         python.parent.mkdir(parents=True)
@@ -347,7 +365,7 @@ class RepositoryToolTests(unittest.TestCase):
         self.assertNotEqual(run.call_args.kwargs["cwd"], self.root)
         self.assertEqual(result["sandbox"], "disposable repository copy")
 
-    @patch("harness._run_bounded_process")
+    @patch("harness.tools.shell._run_bounded_process")
     def test_run_tests_uses_configured_container_interpreter(self, run):
         python = self.root / "container-python"
         python.touch()
@@ -365,7 +383,7 @@ class RepositoryToolTests(unittest.TestCase):
 
         self.assertEqual(run.call_args.args[0][0], str(python))
 
-    @patch("harness._run_bounded_process")
+    @patch("harness.tools.shell._run_bounded_process")
     def test_run_tests_reports_timeouts_as_bounded_results(self, run):
         python = self.root / ".venv/bin/python"
         python.parent.mkdir(parents=True)
@@ -384,20 +402,7 @@ class RepositoryToolTests(unittest.TestCase):
         self.assertEqual(result["output"], "partial")
 
 
-class EditingAndShellToolTests(unittest.TestCase):
-    def setUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp_dir.cleanup)
-        self.root = Path(self.temp_dir.name).resolve()
-        self.root_patch = patch("harness._repository_root", return_value=self.root)
-        self.root_patch.start()
-        self.addCleanup(self.root_patch.stop)
-
-    def write_text(self, relative_path, content):
-        path = self.root / relative_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
-        return path
+class EditingAndShellToolTests(WorkspaceTestCase):
 
     def test_apply_patch_updates_adds_and_deletes_text_files(self):
         self.write_text("update.txt", "old\nkeep\n")
@@ -481,7 +486,7 @@ class EditingAndShellToolTests(unittest.TestCase):
         self.assertTrue(result["applied"])
         self.assertEqual((self.root / "example.txt").read_text(), "after\n")
 
-    @patch("harness._run_bounded_process")
+    @patch("harness.tools.shell._run_bounded_process")
     def test_run_shell_uses_a_disposable_repository_copy(self, run_process):
         self.write_text("tracked.txt", "content\n")
         captured = {}
@@ -509,7 +514,7 @@ class EditingAndShellToolTests(unittest.TestCase):
         self.assertEqual(captured["command"][0], "git")
         self.assertNotIn("CEREBRAS_API_KEY", run_process.call_args.kwargs["env"])
 
-    @patch("harness.shutil.copytree")
+    @patch("harness.tools.shell.shutil.copytree")
     def test_run_shell_rejects_non_allowlisted_commands_before_copying(self, copytree):
         invalid = (
             "rm -rf .",
@@ -554,20 +559,7 @@ class EditingAndShellToolTests(unittest.TestCase):
         self.assertEqual((self.root / "allowed.txt").read_text(), "no\n")
 
 
-class ContextEngineeringTests(unittest.TestCase):
-    def setUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp_dir.cleanup)
-        self.root = Path(self.temp_dir.name).resolve()
-        self.root_patch = patch("harness._repository_root", return_value=self.root)
-        self.root_patch.start()
-        self.addCleanup(self.root_patch.stop)
-
-    def write_text(self, relative_path, content):
-        path = self.root / relative_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
-        return path
+class ContextEngineeringTests(WorkspaceTestCase):
 
     def test_default_system_prompt_requires_michael_as_co_author(self):
         self.assertIn(
@@ -903,7 +895,7 @@ Finish the migration
         ]
 
         with patch.dict(harness.os.environ, {"CEREBRAS_API_KEY": "key"}), patch(
-            "harness.Cerebras", return_value=client
+            "harness.cli.Cerebras", return_value=client
         ), redirect_stdout(io.StringIO()):
             first_exit = harness.main([*common, "first question"])
             second_exit = harness.main([*common, "--resume", "second question"])
@@ -974,14 +966,9 @@ class PrintResponseTests(unittest.TestCase):
         self.assertIn("context=1.5% of 1.000 tokens", output)
 
 
-class RunTurnTests(unittest.TestCase):
+class RunTurnTests(WorkspaceTestCase):
     def setUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp_dir.cleanup)
-        self.root = Path(self.temp_dir.name).resolve()
-        self.root_patch = patch("harness._repository_root", return_value=self.root)
-        self.root_patch.start()
-        self.addCleanup(self.root_patch.stop)
+        super().setUp()
         self.store = harness.SessionStore(Path("state/harness.db"), self.root)
         self.logger = harness.EventLogger(self.store, "session-1")
         self.args = make_args()
@@ -1086,7 +1073,7 @@ class RunTurnTests(unittest.TestCase):
         self.assertEqual(result["error"]["type"], "ToolArgumentError")
         self.assertEqual(messages[-1]["content"], "I could not calculate that.")
 
-    @patch("harness._prompt_for_tool_approval", return_value=False)
+    @patch("harness.agent.loop._prompt_for_tool_approval", return_value=False)
     def test_denied_approval_is_logged_and_returned_to_the_model(self, _approval):
         self.args.approval_policy = "ask"
         client = Mock()
@@ -1143,7 +1130,7 @@ class RunTurnTests(unittest.TestCase):
         self.assertEqual(decisions[-1]["decision"], "max_turns_exceeded")
 
     @patch(
-        "harness._remaining_seconds",
+        "harness.agent.loop._remaining_seconds",
         side_effect=[1.0, harness.AgentTimeoutError("agent loop timed out")],
     )
     def test_timeout_stops_loop_and_rolls_back_history(self, _remaining):
@@ -1158,20 +1145,15 @@ class RunTurnTests(unittest.TestCase):
         self.assertEqual(self.read_events()[-1]["error_type"], "AgentTimeoutError")
 
 
-class InteractiveCliTests(unittest.TestCase):
+class InteractiveCliTests(WorkspaceTestCase):
     def setUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp_dir.cleanup)
-        self.root = Path(self.temp_dir.name).resolve()
-        self.root_patch = patch("harness._repository_root", return_value=self.root)
-        self.root_patch.start()
-        self.addCleanup(self.root_patch.stop)
+        super().setUp()
         self.store = harness.SessionStore(Path("state/harness.db"), self.root)
         self.logger = harness.EventLogger(self.store, "session-1")
         self.args = make_args()
         self.messages = [{"role": "system", "content": "test"}]
 
-    @patch("harness.sys.stdin.isatty", return_value=False)
+    @patch("harness.cli.sys.stdin.isatty", return_value=False)
     def test_non_interactive_input_requires_a_prompt(self, _isatty):
         stderr = io.StringIO()
 
@@ -1183,7 +1165,7 @@ class InteractiveCliTests(unittest.TestCase):
         self.assertEqual(exit_code, 2)
         self.assertIn("provide a prompt", stderr.getvalue())
 
-    @patch("harness.sys.stdin.isatty", return_value=True)
+    @patch("harness.cli.sys.stdin.isatty", return_value=True)
     @patch("builtins.input", side_effect=["/help", "/exit"])
     def test_help_then_exit_does_not_call_the_api(self, _input, _isatty):
         client = Mock()
@@ -1198,7 +1180,7 @@ class InteractiveCliTests(unittest.TestCase):
         self.assertIn("/clear", stdout.getvalue())
         client.chat.completions.create.assert_not_called()
 
-    @patch("harness.sys.stdin.isatty", return_value=True)
+    @patch("harness.cli.sys.stdin.isatty", return_value=True)
     @patch("builtins.input", side_effect=["/clear", "/exit"])
     def test_clear_removes_conversation_but_keeps_system_prompt(
         self, _input, _isatty
