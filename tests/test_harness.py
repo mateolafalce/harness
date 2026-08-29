@@ -1,6 +1,7 @@
 import argparse
 import io
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -965,6 +966,416 @@ class PrintResponseTests(unittest.TestCase):
         self.assertIn("cached=4 tokens", output)
         self.assertIn("context=1.5% of 1.000 tokens", output)
 
+    def test_skips_metrics_line_when_the_prompt_owns_them(self):
+        stdout = io.StringIO()
+        metrics = {
+            "prompt_tokens": 10,
+            "cached_tokens": 4,
+            "completion_tokens": 5,
+            "total_tokens": 15,
+            "latency_ms": 25.0,
+            "context_window_tokens": 1_000,
+            "context_used_percent": 1.5,
+        }
+
+        with redirect_stdout(stdout):
+            with harness.prompt_status_session():
+                harness.print_response("Hello", metrics)
+
+        output = stdout.getvalue()
+        self.assertIn("assistant>", output)
+        self.assertIn("Hello", output)
+        self.assertNotIn("metrics>", output)
+        self.assertEqual(harness.last_response_metrics()["total_tokens"], 15)
+
+    def test_renders_submitted_user_input_in_the_transcript(self):
+        stdout = io.StringIO()
+
+        with redirect_stdout(stdout):
+            harness.print_user_input("cuéntame un chiste")
+
+        output = stdout.getvalue()
+        self.assertIn("you> cuéntame un chiste", output)
+
+
+class PromptChromeTests(unittest.TestCase):
+    def test_model_label_uses_the_gpt_model_not_grok(self):
+        label = harness.model_label("gpt-oss-120b", "high")
+        self.assertEqual(label, "gpt-oss-120b (high)")
+        self.assertNotIn("Grok", label)
+        self.assertNotIn("always-approve", label)
+
+    def test_input_row_right_aligns_the_model_inside_the_box(self):
+        from harness.display import _input_row
+
+        label = harness.model_label("gpt-oss-120b", "medium")
+        row = _input_row("hello", label, 72)
+        self.assertEqual(len(row), 72)
+        self.assertTrue(row.startswith("│ > hello"))
+        self.assertTrue(row.endswith("gpt-oss-120b (medium) │"))
+        self.assertNotIn("always-approve", row)
+
+
+    def test_fallback_prompt_draws_the_box_and_token_metrics(self):
+        stdout = io.StringIO()
+        metrics = {
+            "prompt_tokens": 10,
+            "cached_tokens": 4,
+            "completion_tokens": 5,
+            "total_tokens": 15,
+            "latency_ms": 25.0,
+            "context_window_tokens": 1_000,
+            "context_used_percent": 1.5,
+        }
+        size = os.terminal_size((72, 24))
+
+        with patch("harness.display.shutil.get_terminal_size", return_value=size):
+            with patch("builtins.input", return_value="hello"):
+                with redirect_stdout(stdout):
+                    text = harness.read_prompt(
+                        "gpt-oss-120b", "high", metrics
+                    )
+
+        self.assertEqual(text, "hello")
+        output = stdout.getvalue()
+        self.assertIn("╭", output)
+        self.assertIn("╰", output)
+        self.assertIn("gpt-oss-120b (high)", output)
+        self.assertNotIn("always-approve", output)
+        self.assertNotIn("Grok", output)
+        self.assertIn("prompt=10 tokens", output)
+        self.assertIn("cached=4 tokens", output)
+        self.assertIn("context=1.5% of 1.000 tokens", output)
+
+
+class _TtyBuffer(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+class FullscreenSessionTests(unittest.TestCase):
+    def test_takes_the_terminal_and_paints_it_black(self):
+        buf = _TtyBuffer()
+        size = os.terminal_size((8, 3))
+
+        with patch("harness.display.shutil.get_terminal_size", return_value=size):
+            with patch.dict("os.environ", {"TERM": "xterm-256color"}, clear=False):
+                with harness.fullscreen_session(buf):
+                    buf.write("inside")
+
+        output = buf.getvalue()
+        self.assertIn("\033[?1049h", output)
+        self.assertIn("\033]11;#000000\007", output)
+        self.assertIn("\033[40;37m", output)
+        self.assertIn("\033[?1006h", output)
+        self.assertIn("\033[?1000h", output)
+        self.assertIn("inside", output)
+        self.assertIn("\033]111\007", output)
+        self.assertIn("\033[?1000l", output)
+        self.assertIn("\033[?1049l", output)
+        self.assertLess(output.index("\033[?1049h"), output.index("inside"))
+        self.assertLess(output.index("inside"), output.index("\033[?1049l"))
+        self.assertEqual(output.count(" " * 8), 3)
+
+    def test_skips_fullscreen_when_stdout_is_not_a_tty(self):
+        buf = io.StringIO()
+
+        with patch.dict("os.environ", {"TERM": "xterm-256color"}, clear=False):
+            with harness.fullscreen_session(buf):
+                buf.write("plain")
+
+        self.assertEqual(buf.getvalue(), "plain")
+
+    def test_skips_fullscreen_on_dumb_terminals(self):
+        buf = _TtyBuffer()
+
+        with patch.dict("os.environ", {"TERM": "dumb"}, clear=False):
+            with harness.fullscreen_session(buf):
+                buf.write("plain")
+
+        self.assertEqual(buf.getvalue(), "plain")
+
+    def test_restores_the_terminal_when_the_session_raises(self):
+        buf = _TtyBuffer()
+        size = os.terminal_size((4, 2))
+
+        with patch("harness.display.shutil.get_terminal_size", return_value=size):
+            with patch.dict("os.environ", {"TERM": "xterm-256color"}, clear=False):
+                with self.assertRaises(RuntimeError):
+                    with harness.fullscreen_session(buf):
+                        raise RuntimeError("boom")
+
+        output = buf.getvalue()
+        self.assertIn("\033[?1049h", output)
+        self.assertIn("\033[?1049l", output)
+        self.assertLess(output.index("\033[?1000l"), output.index("\033[?1049l"))
+
+
+class KeyDecodeTests(unittest.TestCase):
+    def test_true_eof_is_eof(self):
+        from harness.display import _read_key
+
+        kind, value = _read_key(io.StringIO(""))
+        self.assertEqual((kind, value), ("eof", ""))
+
+    def test_printable_character(self):
+        from harness.display import _read_key
+
+        kind, value = _read_key(io.StringIO("a"))
+        self.assertEqual((kind, value), ("char", "a"))
+
+    def test_arrow_up_is_scroll_not_eof(self):
+        from harness.display import _read_key
+
+        kind, value = _read_key(io.StringIO("\x1b[A"))
+        self.assertEqual((kind, value), ("scroll_up", ""))
+
+    def test_sgr_wheel_up_is_scroll_not_eof(self):
+        from harness.display import _read_key
+
+        kind, value = _read_key(io.StringIO("\x1b[<64;8;12M"))
+        self.assertEqual((kind, value), ("scroll_up", ""))
+
+    def test_sgr_burst_does_not_leak_payload_as_typed_text(self):
+        from harness.display import _read_key
+
+        stdin = io.StringIO("\x1b[<64;8;12M" * 4 + "ok\n")
+        chars = []
+        scrolls = 0
+        while True:
+            kind, value = _read_key(stdin)
+            if kind == "eof":
+                break
+            if kind == "scroll_up":
+                scrolls += 1
+            elif kind == "char":
+                chars.append(value)
+            elif kind == "enter":
+                break
+        self.assertEqual(scrolls, 4)
+        self.assertEqual("".join(chars), "ok")
+        self.assertNotIn("[", chars)
+        self.assertNotIn("\x1b", chars)
+
+    def test_tty_buffered_csi_is_not_typed_when_select_is_idle(self):
+        from harness.display import _read_key
+
+        idle_read, idle_write = os.pipe()
+
+        class _BufferedTty(io.StringIO):
+            def isatty(self) -> bool:
+                return True
+
+            def fileno(self) -> int:
+                return idle_read
+
+            def peek(self, n: int = 1) -> str:
+                start = self.tell()
+                return self.getvalue()[start : start + n]
+
+        stdin = _BufferedTty("\x1b[<65;3;4Mhi")
+        try:
+            kinds = [_read_key(stdin), _read_key(stdin), _read_key(stdin)]
+        finally:
+            os.close(idle_read)
+            os.close(idle_write)
+
+        self.assertEqual(kinds[0], ("scroll_down", ""))
+        self.assertEqual(kinds[1], ("char", "h"))
+        self.assertEqual(kinds[2], ("char", "i"))
+
+    def test_raw_stdin_decodes_utf8_text(self):
+        from harness.display import _RawStdin, _read_key
+
+        read_fd, write_fd = os.pipe()
+        try:
+            os.write(write_fd, "sí\n".encode("utf-8"))
+            os.close(write_fd)
+            write_fd = -1
+            source = _RawStdin(read_fd)
+            chars = []
+            while True:
+                kind, value = _read_key(source)
+                if kind == "eof":
+                    break
+                if kind == "char":
+                    chars.append(value)
+                elif kind == "enter":
+                    break
+            self.assertEqual("".join(chars), "sí")
+        finally:
+            os.close(read_fd)
+            if write_fd != -1:
+                os.close(write_fd)
+
+    def test_raw_stdin_consumes_a_touchpad_burst(self):
+        from harness.display import _RawStdin, _read_key
+
+        read_fd, write_fd = os.pipe()
+        try:
+            os.write(write_fd, b"\x1b[<64;8;12M" * 3 + b"ab\n")
+            os.close(write_fd)
+            write_fd = -1
+            source = _RawStdin(read_fd)
+            chars = []
+            scrolls = 0
+            while True:
+                kind, value = _read_key(source)
+                if kind == "eof":
+                    break
+                if kind == "scroll_up":
+                    scrolls += 1
+                elif kind == "char":
+                    chars.append(value)
+                elif kind == "enter":
+                    break
+            self.assertEqual(scrolls, 3)
+            self.assertEqual("".join(chars), "ab")
+        finally:
+            os.close(read_fd)
+            if write_fd != -1:
+                os.close(write_fd)
+
+    def test_sgr_wheel_down_is_scroll(self):
+        from harness.display import _read_key
+
+        kind, value = _read_key(io.StringIO("\x1b[<65;8;12M"))
+        self.assertEqual((kind, value), ("scroll_down", ""))
+
+    def test_application_arrow_up_is_scroll(self):
+        from harness.display import _read_key
+
+        kind, value = _read_key(io.StringIO("\x1bOA"))
+        self.assertEqual((kind, value), ("scroll_up", ""))
+
+    def test_x10_wheel_up_is_scroll(self):
+        from harness.display import _read_key
+
+        kind, value = _read_key(io.StringIO("\x1b[M" + chr(96) + "!!"))
+        self.assertEqual((kind, value), ("scroll_up", ""))
+
+    def test_page_up_is_not_eof(self):
+        from harness.display import _read_key
+
+        kind, value = _read_key(io.StringIO("\x1b[5~"))
+        self.assertEqual((kind, value), ("page_up", ""))
+
+    def test_live_prompt_ignores_touchpad_scroll_and_keeps_text(self):
+        from harness import display
+
+        stdin = io.StringIO("\x1b[A\x1b[<64;1;1M" * 5 + "hello\n")
+        stdout = io.StringIO()
+        stdin.fileno = lambda: 0  # type: ignore[method-assign]
+
+        with patch.object(display, "sys") as display_sys:
+            display_sys.stdin = stdin
+            display_sys.stdout = stdout
+            with patch.object(display, "termios") as termios_mod:
+                termios_mod.tcgetattr.return_value = object()
+                termios_mod.TCSADRAIN = 1
+                with patch.object(display, "tty"):
+                    text = display._read_live_prompt(
+                        "gpt-oss-120b (medium)", display.empty_metrics()
+                    )
+
+        self.assertEqual(text, "hello")
+
+    def test_live_prompt_keeps_the_cursor_on_the_typed_text(self):
+        from harness import display
+
+        stdin = io.StringIO("hi\n")
+        stdout = io.StringIO()
+        stdin.fileno = lambda: 0  # type: ignore[method-assign]
+        previous_size = display._SCREEN_SIZE
+        display._SCREEN_SIZE = (80, 24)
+
+        try:
+            with patch.object(display, "sys") as display_sys:
+                display_sys.stdin = stdin
+                display_sys.stdout = stdout
+                with patch.object(display, "termios") as termios_mod:
+                    termios_mod.tcgetattr.return_value = object()
+                    termios_mod.TCSADRAIN = 1
+                    with patch.object(display, "tty"):
+                        text = display._read_live_prompt(
+                            "gpt-oss-120b (medium)", display.empty_metrics()
+                        )
+        finally:
+            display._SCREEN_SIZE = previous_size
+
+        self.assertEqual(text, "hi")
+        output = stdout.getvalue()
+        self.assertIn("\033[?25l", output)
+        # Box starts at column 2; input row is 21; after "hi" the caret is column 8.
+        self.assertIn("\033[21;8H\033[?25h", output)
+        self.assertIn("\033[20;2H", output)
+        reveals = output.split("\033[?25h")
+        painted = [chunk for chunk in reveals[:-1] if "\033[?25l" in chunk]
+        self.assertGreaterEqual(len(painted), 2)
+        for chunk in painted:
+            hidden = chunk[chunk.rfind("\033[?25l") :]
+            self.assertTrue(
+                hidden.rstrip().endswith("\033[21;6H")
+                or hidden.rstrip().endswith("\033[21;7H")
+                or hidden.rstrip().endswith("\033[21;8H"),
+                hidden[-40:],
+            )
+
+
+class TranscriptScrollTests(unittest.TestCase):
+    def tearDown(self):
+        from harness import display
+
+        display._TRANSCRIPT = None
+        display._RECORD_TRANSCRIPT = True
+        display._SCREEN_SIZE = (80, 24)
+
+    def test_scroll_redraws_older_rows_in_the_viewport(self):
+        from harness import display
+
+        real = io.StringIO()
+        transcript = display._TranscriptStream(real)
+        display._TRANSCRIPT = transcript
+        display._SCREEN_SIZE = (20, 10)
+        display._RECORD_TRANSCRIPT = True
+        for index in range(12):
+            transcript.write(f"line{index}\n")
+
+        real.seek(0)
+        real.truncate(0)
+        display._scroll_transcript(5)
+
+        output = real.getvalue()
+        self.assertIn("line3", output)
+        self.assertIn("line6", output)
+        self.assertNotIn("line0", output)
+        self.assertNotIn("line11", output)
+        self.assertEqual(transcript.offset, 5)
+
+    def test_transcript_is_inset_by_one_column(self):
+        from harness import display
+
+        real = io.StringIO()
+        transcript = display._TranscriptStream(real)
+        display._TRANSCRIPT = transcript
+        display._SCREEN_SIZE = (20, 10)
+        display._RECORD_TRANSCRIPT = True
+        transcript.write("hello\n")
+
+        self.assertEqual(real.getvalue(), " hello\n")
+        self.assertEqual(transcript.rows(), ["hello"])
+
+    def test_cannot_scroll_past_the_oldest_row(self):
+        from harness import display
+
+        real = io.StringIO()
+        transcript = display._TranscriptStream(real)
+        display._TRANSCRIPT = transcript
+        display._SCREEN_SIZE = (20, 10)
+        transcript.write("only\n")
+        display._scroll_transcript(20)
+        self.assertEqual(transcript.offset, 0)
+
 
 class RunTurnTests(WorkspaceTestCase):
     def setUp(self):
@@ -1164,6 +1575,69 @@ class InteractiveCliTests(WorkspaceTestCase):
 
         self.assertEqual(exit_code, 2)
         self.assertIn("provide a prompt", stderr.getvalue())
+
+    @patch("harness.cli.fullscreen_session")
+    @patch("harness.cli.sys.stdin.isatty", return_value=True)
+    @patch("builtins.input", side_effect=["/exit"])
+    def test_interactive_mode_enters_fullscreen_session(
+        self, _input, _isatty, fullscreen
+    ):
+        fullscreen.return_value.__enter__.return_value = None
+        client = Mock()
+
+        with redirect_stdout(io.StringIO()):
+            exit_code = harness.interactive_cli(
+                client, self.messages, self.args, self.logger
+            )
+
+        self.assertEqual(exit_code, 0)
+        fullscreen.assert_called_once()
+
+    @patch("harness.cli.sys.stdin.isatty", return_value=True)
+    @patch("builtins.input", side_effect=["/exit"])
+    def test_interactive_prompt_shows_gpt_model_and_token_metrics(
+        self, _input, _isatty
+    ):
+        args = make_args(model="gpt-oss-120b", reasoning_effort="high")
+        size = os.terminal_size((80, 24))
+        stdout = io.StringIO()
+
+        with patch("harness.display.shutil.get_terminal_size", return_value=size):
+            with redirect_stdout(stdout):
+                exit_code = harness.interactive_cli(
+                    Mock(), self.messages, args, self.logger
+                )
+
+        self.assertEqual(exit_code, 0)
+        output = stdout.getvalue()
+        self.assertIn("╭", output)
+        self.assertIn("gpt-oss-120b (high)", output)
+        self.assertNotIn("always-approve", output)
+        self.assertNotIn("Grok", output)
+        self.assertNotIn("you>", output)
+        self.assertNotIn("Harness.", output)
+        self.assertNotIn("Type /help for help", output)
+        self.assertNotIn("Stage 5", output)
+        self.assertIn("prompt=n/a tokens", output)
+        self.assertIn("context=n/a", output)
+        self.assertIn("1.000 tokens", output)
+
+    @patch("harness.cli.run_turn", return_value=0)
+    @patch("harness.cli.sys.stdin.isatty", return_value=True)
+    @patch("builtins.input", side_effect=["cuéntame un chiste", "/exit"])
+    def test_interactive_echoes_user_input_in_the_transcript(
+        self, _input, _isatty, run_turn
+    ):
+        stdout = io.StringIO()
+
+        with redirect_stdout(stdout):
+            exit_code = harness.interactive_cli(
+                Mock(), self.messages, self.args, self.logger
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("you> cuéntame un chiste", stdout.getvalue())
+        run_turn.assert_called_once()
 
     @patch("harness.cli.sys.stdin.isatty", return_value=True)
     @patch("builtins.input", side_effect=["/help", "/exit"])

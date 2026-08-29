@@ -16,6 +16,14 @@ from dotenv import load_dotenv
 from harness.agent.compaction import compact_history
 from harness.agent.context import build_system_prompt, load_instruction_documents
 from harness.agent.loop import clear_conversation_context, report_turn_error, run_turn
+from harness.display import (
+    empty_metrics,
+    fullscreen_session,
+    last_response_metrics,
+    print_user_input,
+    prompt_status_session,
+    read_prompt,
+)
 from harness.config import (
     APPROVAL_POLICIES,
     DEFAULT_COMPACTION_THRESHOLD,
@@ -199,70 +207,79 @@ def interactive_cli(
         )
         return 2
 
-    print("Harness Stage 5. Type /help for help or /exit to quit.")
-    while True:
-        try:
-            prompt = input("\nyou> ").strip()
-        except EOFError:
-            print()
-            return 0
-        except KeyboardInterrupt:
-            print("\nUse /exit or Ctrl-D to quit.")
-            continue
+    with fullscreen_session(), prompt_status_session():
+        metrics = empty_metrics(getattr(args, "context_window", None))
+        while True:
+            try:
+                prompt = read_prompt(
+                    args.model,
+                    getattr(args, "reasoning_effort", None),
+                    metrics,
+                ).strip()
+            except EOFError:
+                print()
+                return 0
+            except KeyboardInterrupt:
+                print("\nUse /exit or Ctrl-D to quit.")
+                continue
 
-        if not prompt:
-            continue
-        if prompt in {"/exit", "/quit"}:
-            return 0
-        if prompt == "/help":
-            print(
-                "Ask a question. Commands: /clear, /compact, /help, /exit, /quit"
-            )
-            continue
-        if prompt == "/clear":
-            removed_count = clear_conversation_context(
-                messages, event_logger, session_store
-            )
-            print(
-                "Conversation context cleared "
-                f"({removed_count} message{'s' if removed_count != 1 else ''} removed)."
-            )
-            continue
-        if prompt == "/compact":
-            result = compact_history(
-                messages,
-                getattr(args, "keep_recent_turns", DEFAULT_RECENT_TURNS),
-            )
-            if session_store is not None:
-                session_store.save(
-                    event_logger.session_id, messages, reason="manual_compaction"
+            if not prompt:
+                continue
+            if prompt in {"/exit", "/quit"}:
+                return 0
+            print_user_input(prompt)
+            if prompt == "/help":
+                print(
+                    "Ask a question. Commands: /clear, /compact, /help, /exit, /quit"
                 )
-            if result is None:
-                print("Nothing old enough to compact.")
-            else:
-                event_logger.log(
-                    "conversation_context_compacted",
-                    manual=True,
-                    history_message_count=len(messages),
-                    **result,
+                continue
+            if prompt == "/clear":
+                removed_count = clear_conversation_context(
+                    messages, event_logger, session_store
                 )
-                print(f"Compacted {result['compacted_messages']} older messages.")
-            continue
+                print(
+                    "Conversation context cleared "
+                    f"({removed_count} message{'s' if removed_count != 1 else ''} removed)."
+                )
+                continue
+            if prompt == "/compact":
+                result = compact_history(
+                    messages,
+                    getattr(args, "keep_recent_turns", DEFAULT_RECENT_TURNS),
+                )
+                if session_store is not None:
+                    session_store.save(
+                        event_logger.session_id, messages, reason="manual_compaction"
+                    )
+                if result is None:
+                    print("Nothing old enough to compact.")
+                else:
+                    event_logger.log(
+                        "conversation_context_compacted",
+                        manual=True,
+                        history_message_count=len(messages),
+                        **result,
+                    )
+                    print(
+                        f"Compacted {result['compacted_messages']} older messages."
+                    )
+                continue
 
-        try:
-            run_turn(
-                client,
-                messages,
-                prompt,
-                args,
-                event_logger,
-                session_store,
-                progress_tracker,
-            )
-        except KeyboardInterrupt:
-            print("\nRequest interrupted.", file=sys.stderr)
-        except Exception as exc:
-            report_turn_error(exc)
+            try:
+                run_turn(
+                    client,
+                    messages,
+                    prompt,
+                    args,
+                    event_logger,
+                    session_store,
+                    progress_tracker,
+                )
+                metrics = last_response_metrics() or metrics
+            except KeyboardInterrupt:
+                print("\nRequest interrupted.", file=sys.stderr)
+            except Exception as exc:
+                report_turn_error(exc)
 
 
 def main(argv: list[str] | None = None) -> int:
