@@ -1756,6 +1756,141 @@ class RunTurnTests(WorkspaceTestCase):
         self.assertEqual(messages, [{"role": "system", "content": "test"}])
         self.assertEqual(self.read_events()[-1]["error_type"], "AgentTimeoutError")
 
+    def _note_patch(self):
+        return (
+            "*** Begin Patch\n"
+            "*** Update File: note.txt\n"
+            "@@\n"
+            "-old\n"
+            "+new\n"
+            "*** End Patch"
+        )
+
+    def _prepare_patch_turn(self):
+        self.write_text("note.txt", "old\n")
+        self.args.approval_policy = "allow"
+        self.args.context_window = 100_000
+        self.args.relevant_files = 0
+        snapshot = [{"role": "system", "content": "rules"}]
+        messages = [{"role": "system", "content": "rules"}]
+        self.store.save("session-1", snapshot, reason="prior_snapshot")
+        progress = harness.ProgressTracker(
+            self.store, "session-1", load_existing=False
+        )
+        return snapshot, messages, progress
+
+    def _snapshot_reasons(self):
+        with sqlite3.connect(self.store.path) as connection:
+            return [
+                row[0]
+                for row in connection.execute(
+                    "SELECT reason FROM context_snapshots ORDER BY id"
+                )
+            ]
+
+    def test_system_exit_before_tool_batch_save_leaves_patch_out_of_session(self):
+        snapshot, messages, progress = self._prepare_patch_turn()
+        client = Mock()
+        client.chat.completions.create.return_value = make_response(
+            content=None,
+            tool_calls=[
+                make_tool_call(
+                    call_id="patch-1",
+                    name="apply_patch",
+                    arguments=json.dumps({"patch": self._note_patch()}),
+                )
+            ],
+        )
+        original_save = self.store.save
+
+        def save_until_tool_batch(session_id, saved_messages, reason="checkpoint"):
+            if reason == "tool_batch":
+                raise SystemExit(1)
+            return original_save(session_id, saved_messages, reason)
+
+        self.store.save = save_until_tool_batch
+        try:
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    harness.run_turn(
+                        client,
+                        messages,
+                        "Update the note",
+                        self.args,
+                        self.logger,
+                        self.store,
+                        progress,
+                    )
+                self.assertEqual(raised.exception.code, 1)
+        finally:
+            self.store.save = original_save
+
+        self.assertEqual(client.chat.completions.create.call_count, 1)
+        self.assertEqual(
+            (self.root / "note.txt").read_text(encoding="utf-8"), "new\n"
+        )
+        self.assertTrue(any(message.get("role") == "tool" for message in messages))
+        session_id, loaded = self.store.load()
+        self.assertEqual((session_id, loaded), ("session-1", snapshot))
+        self.assertEqual(self._snapshot_reasons(), ["prior_snapshot"])
+        checkpoint = self.store.load_progress("session-1")
+        self.assertEqual(checkpoint["status"], "in progress")
+        self.assertIn("Tool `apply_patch` completed.", checkpoint["actions"])
+        self.assertFalse(
+            any(
+                action.startswith("Turn interrupted:")
+                for action in checkpoint["actions"]
+            )
+        )
+
+    def test_api_exception_after_patch_rolls_back_session_and_keeps_file(self):
+        snapshot, messages, progress = self._prepare_patch_turn()
+        client = Mock()
+        client.chat.completions.create.side_effect = [
+            make_response(
+                content=None,
+                tool_calls=[
+                    make_tool_call(
+                        call_id="patch-1",
+                        name="apply_patch",
+                        arguments=json.dumps({"patch": self._note_patch()}),
+                    )
+                ],
+            ),
+            RuntimeError("upstream failed"),
+        ]
+
+        with redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(RuntimeError, "upstream failed"):
+                harness.run_turn(
+                    client,
+                    messages,
+                    "Update the note",
+                    self.args,
+                    self.logger,
+                    self.store,
+                    progress,
+                )
+
+        self.assertEqual(client.chat.completions.create.call_count, 2)
+        self.assertEqual(
+            (self.root / "note.txt").read_text(encoding="utf-8"), "new\n"
+        )
+        self.assertEqual(messages, snapshot)
+        session_id, loaded = self.store.load()
+        self.assertEqual((session_id, loaded), ("session-1", snapshot))
+        self.assertEqual(
+            self._snapshot_reasons(),
+            ["prior_snapshot", "tool_batch", "rollback"],
+        )
+        checkpoint = self.store.load_progress("session-1")
+        self.assertEqual(checkpoint["status"], "interrupted")
+        self.assertIn("Tool `apply_patch` completed.", checkpoint["actions"])
+        self.assertIn(
+            "Turn interrupted: RuntimeError: upstream failed",
+            checkpoint["actions"],
+        )
+
 
 class InteractiveCliTests(WorkspaceTestCase):
     def setUp(self):

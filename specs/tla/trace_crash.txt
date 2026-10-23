@@ -1,0 +1,167 @@
+TLC2 Version 2026.10.23.135453 (rev: 2ef2af8)
+Running breadth-first search Model-Checking with fp 62 and seed 3515205977937448498 with 1 worker on 2 cores with 1723MB heap and 64MB offheap memory [pid: 17772] (Linux 7.0.0-38-generic amd64, Ubuntu 21.0.12.1 64bit, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/mateo/dev/harness/specs/tla/HarnessTurn.tla
+Semantic processing of module HarnessTurn
+Linting of module HarnessTurn
+Starting... (2026-10-23 20:04:29)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-10-23 20:04:30.
+Error: Invariant Inv is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ api_failed = FALSE
+/\ session = "snapshot"
+/\ crashed = FALSE
+/\ resumed = FALSE
+/\ tool_noted = FALSE
+/\ session_reason = "prior"
+/\ progress = "idle"
+/\ phase = "start"
+/\ memory = "snapshot"
+/\ stale_note = FALSE
+/\ process = "alive"
+/\ repo = "clean"
+
+State 2: <TakeHistorySnapshot line 159, col 3 to line 164, col 29 of module HarnessTurn>
+/\ api_failed = FALSE
+/\ session = "snapshot"
+/\ crashed = FALSE
+/\ resumed = FALSE
+/\ tool_noted = FALSE
+/\ session_reason = "prior"
+/\ progress = "idle"
+/\ phase = "snapshotted"
+/\ memory = "snapshot"
+/\ stale_note = FALSE
+/\ process = "alive"
+/\ repo = "clean"
+
+State 3: <AppendUserMessage line 167, col 3 to line 172, col 68 of module HarnessTurn>
+/\ api_failed = FALSE
+/\ session = "snapshot"
+/\ crashed = FALSE
+/\ resumed = FALSE
+/\ tool_noted = FALSE
+/\ session_reason = "prior"
+/\ progress = "idle"
+/\ phase = "user_added"
+/\ memory = "user"
+/\ stale_note = FALSE
+/\ process = "alive"
+/\ repo = "clean"
+
+State 4: <StartProgress line 175, col 3 to line 180, col 68 of module HarnessTurn>
+/\ api_failed = FALSE
+/\ session = "snapshot"
+/\ crashed = FALSE
+/\ resumed = FALSE
+/\ tool_noted = FALSE
+/\ session_reason = "prior"
+/\ progress = "in_progress"
+/\ phase = "progress_started"
+/\ memory = "user"
+/\ stale_note = FALSE
+/\ process = "alive"
+/\ repo = "clean"
+
+State 5: <ModelReturnsApplyPatch line 183, col 3 to line 188, col 68 of module HarnessTurn>
+/\ api_failed = FALSE
+/\ session = "snapshot"
+/\ crashed = FALSE
+/\ resumed = FALSE
+/\ tool_noted = FALSE
+/\ session_reason = "prior"
+/\ progress = "in_progress"
+/\ phase = "patch_requested"
+/\ memory = "assistant"
+/\ stale_note = FALSE
+/\ process = "alive"
+/\ repo = "clean"
+
+State 6: <ApplyPatch line 191, col 3 to line 196, col 68 of module HarnessTurn>
+/\ api_failed = FALSE
+/\ session = "snapshot"
+/\ crashed = FALSE
+/\ resumed = FALSE
+/\ tool_noted = FALSE
+/\ session_reason = "prior"
+/\ progress = "in_progress"
+/\ phase = "wrote"
+/\ memory = "assistant"
+/\ stale_note = FALSE
+/\ process = "alive"
+/\ repo = "patched"
+
+State 7: <RememberToolResult line 199, col 3 to line 204, col 68 of module HarnessTurn>
+/\ api_failed = FALSE
+/\ session = "snapshot"
+/\ crashed = FALSE
+/\ resumed = FALSE
+/\ tool_noted = FALSE
+/\ session_reason = "prior"
+/\ progress = "in_progress"
+/\ phase = "result_in_memory"
+/\ memory = "tool"
+/\ stale_note = FALSE
+/\ process = "alive"
+/\ repo = "patched"
+
+State 8: <LogToolCompleted line 207, col 3 to line 212, col 29 of module HarnessTurn>
+/\ api_failed = FALSE
+/\ session = "snapshot"
+/\ crashed = FALSE
+/\ resumed = FALSE
+/\ tool_noted = FALSE
+/\ session_reason = "prior"
+/\ progress = "in_progress"
+/\ phase = "logged"
+/\ memory = "tool"
+/\ stale_note = FALSE
+/\ process = "alive"
+/\ repo = "patched"
+
+State 9: <RecordTool line 215, col 3 to line 221, col 50 of module HarnessTurn>
+/\ api_failed = FALSE
+/\ session = "snapshot"
+/\ crashed = FALSE
+/\ resumed = FALSE
+/\ tool_noted = TRUE
+/\ session_reason = "prior"
+/\ progress = "tool_anotada"
+/\ phase = "tool_noted"
+/\ memory = "tool"
+/\ stale_note = FALSE
+/\ process = "alive"
+/\ repo = "patched"
+
+State 10: <Crash line 226, col 3 to line 233, col 62 of module HarnessTurn>
+/\ api_failed = FALSE
+/\ session = "snapshot"
+/\ crashed = TRUE
+/\ resumed = FALSE
+/\ tool_noted = TRUE
+/\ session_reason = "prior"
+/\ progress = "tool_anotada"
+/\ phase = "dead"
+/\ memory = "tool"
+/\ stale_note = FALSE
+/\ process = "dead"
+/\ repo = "patched"
+
+State 11: <Resume line 298, col 3 to line 307, col 75 of module HarnessTurn>
+/\ api_failed = FALSE
+/\ session = "snapshot"
+/\ crashed = TRUE
+/\ resumed = TRUE
+/\ tool_noted = TRUE
+/\ session_reason = "session_initialized"
+/\ progress = "tool_anotada"
+/\ phase = "resumed"
+/\ memory = "snapshot"
+/\ stale_note = TRUE
+/\ process = "alive"
+/\ repo = "patched"
+
+12 states generated, 12 distinct states found, 1 states left on queue.
+The depth of the complete state graph search is 11.
+Finished in 01s at (2026-10-23 20:04:30)
